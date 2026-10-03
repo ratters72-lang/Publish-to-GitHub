@@ -1,0 +1,18 @@
+[
+  {
+    "id": 0,
+    "name": "Sydney Roosters",
+    "abbreviation": "ROO",
+    "home_colour": "#00338D",
+    "away_colour": "#FFFFFF",
+    "coach": "Trent Robinson"
+  },
+  {
+    "id": 1,
+    "name": "Manly Sea Eagles",
+    "abbreviation": "MAN",
+    "home_colour": "#7B0035",
+    "away_colour": "#FFFFFF",
+    "coach": "Anthony Seibold"
+  }
+]

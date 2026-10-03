@@ -1,0 +1,2445 @@
+"""
+world/open_play_engine.py -- Single-FSM OpenPlayEngine (rewrite).
+
+Owns the open-play -> tackle -> PTB -> post-ruck -> open-play lifecycle via
+a single internal phase machine mapped to GameSubState for downstream systems.
+
+Key design rules:
+  1. TES runs ONLY during TACKLE_INIT through TACKLE_DOMINANCE.
+     At DOMINANCE->RELEASE, ALL TES geometry/containment/retreat stops.
+  2. PTBManager is the SOLE authority for DH movement during PTB_PREP and PTB_EXEC.
+     dh_controller.move_to_ruck() MUST NOT be called in those phases.
+  3. DH gets defender_role = DefenderRole.DUMMY_HALF at RELEASE and keeps it
+     through PTB.  DH is unfrozen throughout RELEASE -> PTB.
+
+Engine-Spec X-Axis Marker Alignment (MARKER BEHAVIOUR):
+  - Markers do NOT use Y-offsets.  They stand directly behind ruck on X-axis.
+  - Marker A target: (ruck_x + 1.0, ruck_y)
+  - Marker B target: (ruck_x + 2.0, ruck_y)
+  - Markers unfreeze on RELEASE entry, move to targets each frame via Player.update(dt).
+  - On PTB->POST_RUCK: markers frozen for 1s (marker_freeze_timer = 1.0).
+  - POST_RUCK_OPEN_PLAY: freeze timer counts down; when expired role clears to DEF_LINE_READY.
+  - TES/PTBManager do not control markers â€” only OPE does.
+  - No offside. No retreat. No defensive behaviour for markers.
+"""
+print(__file__)
+
+import math
+import random
+
+from world.world_state import (
+    WorldState,
+    GameWorldState,
+    GameSubState,
+    set_ball_carrier,
+    is_in_ruck_bubble,
+    is_tackle_phase,
+)
+from player.player import Player, DefenderRole
+
+from game.tes.tes import tes_start_tackle, _make_ctx
+from game.tes.tes_context import TESContext, PlayerContext, TackleEngagement
+from game.tes.tes_outcomes import TESOutcome
+from game.tes.tes_geometry import can_join
+from game.tes.tes_dominance import (
+    update_waveform,
+    compute_dominance,
+    compute_drive_distance,
+    compute_tackle_duration,
+    compute_ptb_time,
+)
+from game.tes.tes_checks import (
+    check_offload,
+    check_strip,
+    check_fumble,
+    check_penalty,
+    check_six_again,
+    check_line_break,
+)
+from game.tes.ptb_manager import PTBManager
+from game.attack.attack_lvl_4.dummy_half import DummyHalfController
+from game.attack.attack_lvl_1.attack_geometry import AttackGeometry
+from game.attack.attack_lvl_1.attack_perception import AttackPerception
+from game.attack.attack_lvl_1.attack_tuners import AttackTuners
+from game.attack.attack_lvl_2.ball_carrier_intent import BallCarrierIntent
+from game.attack.attack_lvl_3.run_logic import RunLogic
+from game.attack.attack_lvl_4.attack_controller import AttackController
+from game.debug.freeze_audit import FreezeAndMovementAuditAgent
+from game.debug.defence_reactivity_audit import audit_defence_reactivity
+from game.defence.defence_lvl_1.defensive_behaviour_unified import DefensiveBehaviourUnified
+from game.defence.defence_lvl_1.defensive_tuners import DefenceTuners
+from game.defence.defence_lvl_1.defensive_geometry import DefensiveGeometry
+from game.defence.defence_lvl_1.defensive_line_manager import DefensiveLineManager
+
+# â”€â”€ Movement contracts (SDEA invariants) â”€â”€
+from world.rules.movement_contracts import (
+    apply_phase_invariants,
+    audit_movement,
+    enforce_bc_backward_invariant,
+)
+
+# â”€â”€ Unified TES phase controller â”€â”€
+from world.rules.release_controller import ai_tes_controller
+
+
+# -- Constants -----------------------------------------------------------
+TACKLE_RADIUS_M: float = 1.5
+TACKLE_ANGLE_THRESHOLD_DEG: float = 60.0
+POST_PTB_IMMUNITY_FRAMES: int = 8
+RETREAT_DISTANCE_M: float = 10.0
+RELEASE_PAUSE_S: float = 0.15        # brief pause in RELEASE before PTB prep
+RELEASE_MIN_DURATION_S: float = 1.54 # minimum RELEASE so markers reach ruck targets (1.44 s + 0.10 s buffer)
+RELEASE_RECOVERY_SPEED_MPS: float = 1.5  # BC stand-up recovery speed during RELEASE (m/s)
+RECOVERY_BACKWARD_DISTANCE_M: float = 0.5  # BC stand-up backward distance from ruck (m)
+POST_PTB_DELAY_S: float = 0.2        # brief pause before POST_RUCK_OPEN_PLAY
+RETREAT_DURATION_S: float = 1.0      # how long defenders retreat in POST_RUCK
+POST_PTB_COOLDOWN_S: float = 0.5     # tackle immunity after PTB
+
+# -- Section D: TES-phase defender retreat ------------------------------------
+RUCK_BUBBLE_RADIUS_M: float = 3.5           # radius of the ruck bubble (m)
+RETREAT_COMPLIANCE_DISTANCE_M: float = 10.0 # how far behind ruck defenders retreat
+RETREAT_SPEED_FACTOR: float = 0.05          # lerp factor per frame for retreat
+
+# -- PTB_PREP Gate constants (Chunk 3) ----------------------------------------
+DH_BEHIND_DISTANCE_M: float = 1.0          # DH must be exactly 1m behind BC
+DH_POSITION_TOLERANCE_M: float = 0.30      # how close DH must be to 1m target
+DH_LATERAL_TOLERANCE_M: float = 0.30       # max lateral offset from ruck_y
+DH_VELOCITY_STABLE_THRESHOLD_MPS: float = 0.5  # max DH speed to be considered stable
+DH_VELOCITY_STABLE_EXEC_THRESHOLD_MPS: float = 0.3  # stricter for PTB_EXEC
+
+# -- Marker constants (Engine-Spec X-Axis Alignment) --------------------------
+MARKER_A_DEPTH_M: float = 1.0    # Marker A target = ruck_x + 1
+MARKER_B_DEPTH_M: float = 2.0    # Marker B target = ruck_x + 2
+MARKER_MOVE_SPEED_MPS: float = 4.0      # speed when moving to X-axis position
+
+# -- Marker freeze duration (seconds after PTB) -------------------------------
+# Frozen markers: no movement, no physics forces, no collision.
+# Tunable: set to ~0.3 for faster PTB once ruck speed is validated.
+MARKER_FREEZE_DURATION_S: float = 1.0
+
+
+def _retreat_target_x(ruck_x: float) -> float:
+    """X-coordinate defenders retreat to after a ruck (behind the ruck).
+
+    STEP 3 â€” Fixed direction: defence always retreats RIGHT (+X), away
+    from the ruck toward the attacking team's tryline at x=110.
+    """
+    return ruck_x + RETREAT_DISTANCE_M
+
+
+def _move_toward(p: Player, tx: float, ty: float, spd: float, dt: float) -> None:
+    """Simple velocity-based movement toward (tx, ty)."""
+    dx = tx - p.x
+    dy = ty - p.y
+    dist = math.hypot(dx, dy)
+    if dist > 0.01:
+        p.vx = (dx / dist) * spd
+        p.vy = (dy / dist) * spd
+        p.x += p.vx * dt
+        p.y += p.vy * dt
+    else:
+        p.vx = 0.0
+        p.vy = 0.0
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# OpenPlayEngine
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+class OpenPlayEngine:
+    """
+    Single FSM for open-play -> tackle -> PTB -> post-ruck -> open-play.
+
+    Internal phases (self._phase):
+        OPEN_PLAY,
+        TACKLE_INIT, TACKLE_CONTACT, TACKLE_DRIVE, TACKLE_DOMINANCE,
+        RELEASE,
+        PTB_PREP, PTB_EXEC, PTB,
+        POST_RUCK_OPEN_PLAY
+
+    Each maps to a GameSubState for downstream consumption (defence, markers, etc.).
+    Defence runs ONLY during OPEN_PLAY â€” the call to _update_defence() in update()
+    is gated behind `if self._phase == "OPEN_PLAY"`.  During all other phases
+    (tackle, release, PTB, post-ruck), movement is managed by the phase handler
+    itself (e.g. _update_release, _update_ptb_prep, etc.) or by the
+    DefenceReactivityAgent.
+    """
+
+    def __init__(self, world: WorldState, seed=None):
+        self.world = world
+        self.rng = random.Random(seed)
+
+        # -- Delegates --
+        self.ptb_manager = PTBManager()
+        self.dh_controller = DummyHalfController()
+
+        # -- Internal phase machine: always OPEN_PLAY from frame 0 --
+        self._phase = "OPEN_PLAY"
+        self._phase_timer: float = 0.0
+
+        # -- Tackle / TES state --
+        self.ball_carrier: Player | None = None
+        self.primary: Player | None = None       # primary tackler
+        self.joiners: list[Player] = []           # secondary tacklers
+        self.tes_ctx: TESContext | None = None
+        self.tes_outcome: TESOutcome | None = None
+
+        # -- Cooldown / immunity --
+        self._cooldown_timer: float = 0.0
+        self.frames_since_ptb: int = 0
+
+        # -- Post-PTB scoot system: reset on PTB complete --
+        self._ptb_complete_handled: bool = False
+
+        # -- PTB gate safety timeout: force-transition after N frames if gate blocks --
+        self._ptb_gate_override_frames: int = 999999  # reset per phase entry
+
+        # -- Phase-4D-2: tackle approach micro-state flag --
+        self.bc_in_approach = False
+
+        # --- Phase 4 HS Attack Modules -------------------------------------------
+        self.attack_geometry = AttackGeometry(self)
+        self.attack_perception = AttackPerception(self.attack_geometry)
+        self.ball_carrier_intent = BallCarrierIntent()
+        self.run_logic = RunLogic()
+
+        # -- Phase-2 defence tuners --
+        self.def_tuners = DefenceTuners()
+        self.def_tuners.assert_radii()
+
+        # -- Phase-2 defence (unified Lvlâ€‘1 / STEPâ€‘2 behaviour) --
+        self.def_behaviour = DefensiveBehaviourUnified(self.def_tuners)
+
+        # -- Phase-E STEPâ€‘1 geometry layer --
+        self.def_geometry = DefensiveGeometry(self.def_tuners)
+
+        # -- DH reference (set during RELEASE, used through PTB) --
+        self.dh: Player | None = None
+
+        # -- D-Series: Defensive line manager --
+        self.defensive_line_manager = DefensiveLineManager(self.world)
+
+        # -- RELEASE first-frame detection flag --
+        self._just_entered_release: bool = False
+
+        # -- Freeze audit agent (debug diagnostics) --
+        self.freeze_audit = FreezeAndMovementAuditAgent()
+
+        # -- Line-break detection flag --
+        self._line_break_active: bool = False
+
+        # -- Deferred D-series state (applied by _update_defence on next OPEN_PLAY) --
+        self._pending_anchor_x: float | None = None
+        self._pending_spacing_y: float | None = None
+        self._pending_retreat_reset: bool = False
+
+        # -- Attack controller (geometry-driven steering, replaces AttackerAI + DecisionEngine) --
+        self.attack_controller = AttackController(
+            self.attack_geometry,
+            self.attack_perception,
+            self.run_logic,
+        )
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # MARKER HELPERS (Engine-Spec X-Axis Alignment)
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _get_ruck_x(self) -> float:
+        """Return current ruck X or a fallback."""
+        ruck_x = getattr(self.world, "ruck_x_m", None)
+        if ruck_x is not None:
+            return ruck_x
+        bc = self.ball_carrier
+        if bc is not None:
+            return bc.x
+        return 60.0
+
+    def _get_ruck_y(self) -> float:
+        """Return current ruck Y or a fallback."""
+        ruck_y = getattr(self.world, "ruck_y_m", None)
+        if ruck_y is not None:
+            return ruck_y
+        bc = self.ball_carrier
+        if bc is not None:
+            return bc.y
+        return 35.0
+
+    def _marker_target_a(self) -> tuple[float, float]:
+        """Target position for Marker A: (ruck_x + 1, ruck_y)."""
+        rx = self._get_ruck_x()
+        ry = self._get_ruck_y()
+        return (rx + MARKER_A_DEPTH_M, ry)
+
+    def _marker_target_b(self) -> tuple[float, float]:
+        """Target position for Marker B: (ruck_x + 2, ruck_y)."""
+        rx = self._get_ruck_x()
+        ry = self._get_ruck_y()
+        return (rx + MARKER_B_DEPTH_M, ry)
+
+    def _get_marker_target(self, player: Player) -> tuple[float, float] | None:
+        """Return (target_x, target_y) for a marker, or None if not a marker."""
+        role = getattr(player, "defender_role", None)
+        if role == DefenderRole.MARKER_A:
+            return self._marker_target_a()
+        elif role == DefenderRole.MARKER_B:
+            return self._marker_target_b()
+        return None
+
+    def _get_markers(self) -> list[Player]:
+        """Return list of current marker players from defending team."""
+        markers = []
+        for d in self.world.defending_team:
+            role = getattr(d, "defender_role", None)
+            if role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B):
+                markers.append(d)
+        return markers
+
+    def _move_markers_to_targets(self, dt: float) -> None:
+        """Set target_x/target_y for both markers every frame.
+
+        Marker A: (ruck_x + 1.0, ruck_y)
+        Marker B: (ruck_x + 2.0, ruck_y)
+
+        Only sets targets â€” Player.update(dt) moves them.
+        Called from RELEASE, PTB_PREP, PTB_EXEC every frame.
+        """
+        for p in self._get_markers():
+            target = self._get_marker_target(p)
+            if target is not None:
+                p.target_x = target[0]
+                p.target_y = target[1]
+            p.move_speed = MARKER_MOVE_SPEED_MPS
+
+    def _unfreeze_markers(self) -> None:
+        """Unfreeze all markers so they can move to X-axis positions.
+
+        NOTE: After this runs, ``apply_phase_invariants()`` will re-evaluate
+        freeze state for the RELEASE phase.  This method is only needed to
+        signal intent â€” the freeze authority is ``apply_phase_invariants()``.
+        """
+        # Legacy unfreeze removed â€” apply_phase_invariants() owns freeze now.
+        pass
+
+    def _clear_marker_roles(self) -> None:
+        """Convert remaining MARKER_A/B to DEF_LINE_READY.
+
+        Called at POST_RUCK_OPEN_PLAY entry after freeze timer expires.
+        """
+        for d in self.world.defending_team:
+            if d.defender_role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B):
+                d.defender_role = DefenderRole.DEF_LINE_READY
+
+    # ═══════════════════════════════════════════════════════════════
+    # POST-PTB SCOOT SYSTEM — marker lock + counter reset
+    # ═══════════════════════════════════════════════════════════════
+
+    def _on_ptb_complete(self) -> None:
+        """Called when PTB completes — start marker lock timer and reset frame counter.
+
+        Resets world.marker_freeze_timer to 0.0 so markers are re-frozen
+        for `marker_lock_duration_s` seconds.  Resets self.frames_since_ptb
+        so the escape window in AttackController is correctly timed.
+        """
+        self.world.marker_freeze_timer = 0.0
+        self.frames_since_ptb = 0
+        self._ptb_complete_handled = True
+        print(f"[SCOOT] PTB complete — marker freeze timer reset, frames_since_ptb=0")
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # TES ARTEFACT CLEARANCE â€” wipe all TES state before RELEASE
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _clear_tes_artefacts(self) -> None:
+        """Wipe ALL TES artefacts from world and players at RELEASE entry.
+
+        Called ONCE when RELEASE phase begins (from _update_release first
+        frame, via _just_entered_release path).  Ensures:
+
+          1. No TES movement targets survive into RELEASE
+          2. No TES freeze flags remain on non-mover players
+             (movers will be set correctly by the RELEASE freeze controller)
+          3. All TES soft-freeze counters reset to zero
+          4. All TES retreat targets cleared from world
+          5. All TES defensive line anchors cleared
+          6. All TES marker roles cleared (fresh assignment was done by
+             _assign_markers_for_new_tackle in _prepare_release())
+          7. All TES tackler roles cleared
+          8. All TES freeze timers reset
+          9. world.tes_active = False (TES shuts down)
+        """
+        # 1-2. Clear per-player TES artefacts
+        for p in self.world.players:
+            # Clear TES movement targets â€” NOT pinned here; RELEASE/attack
+            # controllers set fresh targets each frame.
+            # p.target_x and p.target_y intentionally NOT pinned.
+            # Clear TES freeze flags â€” will be re-applied by RELEASE freeze controller
+            # Do NOT set frozen=False here â€” the RELEASE freeze controller will decide
+            # Clear any lingering TES flags
+            p.is_tackler = False
+            p.in_contact = False
+            p.tackle_locked = False
+            p.tes_locked = False
+            # Clear freeze timers
+            p.freeze_timer = 0.0
+            # Clear soft-freeze stuck counter attribute if it exists
+            if hasattr(p, "_soft_freeze_counter"):
+                p._soft_freeze_counter = 0
+            # Clear any TES-era attack_role overrides (keep BC/DH)
+            if getattr(p, "attack_role", "none") in ("none",):
+                pass  # keep as-is
+
+        # 3. Reset soft-freeze stuck counters
+        if hasattr(self, "stuck_counters"):
+            self.stuck_counters.clear()
+
+        # 4. Clear world-level retreat targets
+        self.world.defensive_line_anchor = 0.0
+
+        # 5. Clear defensive line anchors (already done above)
+
+        # 6. TES tackler roles already cleared per-player above
+        # 7. TES freeze timers already cleared per-player above
+
+        # 9. Shut down TES
+        self.world.tes_active = False
+
+        print("[TES_CLEAR] All TES artefacts cleared at RELEASE entry")
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # FRESH MARKER ASSIGNMENT â€” per-tackle, not persistent
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _assign_markers_for_new_tackle(self) -> None:
+        """Assign fresh markers for this tackle cycle.
+
+        Clears ALL existing MARKER_A/B roles first, then applies the
+        3-case rugby-league rule:
+
+          CASE 1 (2+ tacklers):  Marker A = tackler[0], Marker B = tackler[1]
+          CASE 2 (1 tackler):    Marker A = tackler,   Marker B = closest defender
+          CASE 3 (0 tacklers):   Marker A/B = two closest defenders to ruck
+
+        Old markers not selected become DEF_RETREAT_10 (unfrozen).
+        Called ONCE from _prepare_release() at DOMINANCE -> RELEASE boundary.
+
+        This replaces the old persistent-marker pattern where markers from
+        Tackle N survived into Tackle N+1 and overwrote fresh assignment.
+        """
+        defenders = self.world.defending_team
+        ruck_x = self.world.ruck_x_m
+        ruck_y = self.world.ruck_y_m
+
+        # â”€â”€ Step 1: Strip ALL stale MARKER_A/B roles â”€â”€
+        for d in defenders:
+            if d.defender_role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B):
+                d.defender_role = DefenderRole.DEF_RETREAT_10
+                d.freeze_timer = 0.0
+
+        # â”€â”€ Step 2: Identify tacklers (TACKLER_1/2/3 roles from TES) â”€â”€
+        tacklers = [d for d in defenders
+                    if d.defender_role in (DefenderRole.TACKLER_1,
+                                           DefenderRole.TACKLER_2,
+                                           DefenderRole.TACKLER_3)]
+
+        m_a = None
+        m_b = None
+
+        # â”€â”€ CASE 1: Two or more tacklers â†’ Marker A/B = first two â”€â”€
+        if len(tacklers) >= 2:
+            m_a = tacklers[0]
+            m_b = tacklers[1]
+
+        # â”€â”€ CASE 2: One tackler â†’ Marker A = tackler, Marker B = closest defender â”€â”€
+        elif len(tacklers) == 1:
+            m_a = tacklers[0]
+            others = [d for d in defenders if d is not m_a]
+            if others:
+                m_b = min(others, key=lambda d: abs(d.x - ruck_x))
+
+        # â”€â”€ CASE 3: No tacklers â†’ Marker A/B = two closest defenders to ruck â”€â”€
+        else:
+            sorted_by_ruck = sorted(defenders,
+                                    key=lambda d: (d.x - ruck_x) ** 2 + (d.y - ruck_y) ** 2)
+            if len(sorted_by_ruck) >= 1:
+                m_a = sorted_by_ruck[0]
+            if len(sorted_by_ruck) >= 2:
+                m_b = sorted_by_ruck[1]
+
+        # â”€â”€ Step 3: Clear stale TACKLER frozen state on non-selected tacklers â”€â”€
+        # Tacklers (TACKLER_1/2/3) may still be frozen from TES.
+        # If they are NOT selected as a marker, they must be unfrozen
+        # and given a proper retreat role.
+        for d in tacklers:
+            if d is m_a or d is m_b:
+                continue  # Will be set to MARKER_* below
+            d.defender_role = DefenderRole.DEF_RETREAT_10
+            d.freeze_timer = 0.0
+
+        # â”€â”€ Step 4: Assign roles with temporary freeze â”€â”€
+        # Both markers start frozen so OPE's _update_release() can unfreeze
+        # them on the first RELEASE frame (same as current behaviour).
+        if m_a is not None:
+            m_a.defender_role = DefenderRole.MARKER_A
+            m_a.freeze_timer = self.def_tuners.MARKER_A_FREEZE_AFTER_PTB
+            m_a.target_x = ruck_x + MARKER_A_DEPTH_M
+            m_a.target_y = ruck_y
+            m_a.move_speed = MARKER_MOVE_SPEED_MPS
+
+        if m_b is not None:
+            m_b.defender_role = DefenderRole.MARKER_B
+            m_b.freeze_timer = self.def_tuners.MARKER_B_FREEZE_AFTER_PTB
+            m_b.target_x = ruck_x + MARKER_B_DEPTH_M
+            m_b.target_y = ruck_y
+            m_b.move_speed = MARKER_MOVE_SPEED_MPS
+
+        # â”€â”€ Step 5: Sweep â€” ensure all non-marker defenders are unfrozen â”€â”€
+        # Any defender not selected as a marker must be unfrozen so they
+        # can move into their retreat/line positions during RELEASE.
+        for d in defenders:
+            if d.defender_role not in (DefenderRole.MARKER_A, DefenderRole.MARKER_B):
+                d.freeze_timer = 0.0
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # Kickoff hooks
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def on_kickoff(self):
+        """
+        Compatibility hook for kickoff_engine.
+        Resets pursuit mode and defensive anchor for kickoff chase.
+        """
+        # Reset pursuit mode flag if present
+        if hasattr(self.world, "pursuit_mode"):
+            self.world.pursuit_mode = True
+
+        # Reset defensive anchor if present
+        if hasattr(self.world, "defensive_anchor_x"):
+            self.world.defensive_anchor_x = 0.0
+
+        # Freeze managed by apply_phase_invariants() on next frame
+        pass
+
+    def on_ball_secured(self):
+        """
+        Compatibility hook for kickoff_engine.
+        Called when the ball is caught after kickoff.
+        Ensures open play systems are active.
+        """
+        self.world.first_tackle_not_made = False
+        # Reset pursuit mode
+        if hasattr(self.world, "pursuit_mode"):
+            self.world.pursuit_mode = False
+
+        # Freeze managed by apply_phase_invariants() on next frame
+        pass
+
+        # Ensure ball carrier is registered
+        bc = self.world.ball_carrier
+        if bc is not None:
+            pass  # freeze managed by apply_phase_invariants()
+
+    # -- Backward-compat property: run.py and debug scripts read open_play.tes_phase.value --
+    @property
+    def tes_phase(self):
+        """Return a compat object with .value matching the current internal phase string."""
+        class _CompatPhase:
+            def __init__(self, phase_str):
+                self.value = phase_str
+        return _CompatPhase(self._phase)
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # Main entry -- called once per frame
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def update(self, dt: float) -> None:
+        """Main update -- dispatch to current phase handler.
+
+        Defence ALWAYS runs every frame, independent of phase or
+        ball-carrier status.  Attack pipeline (decision engine, intent,
+        run vector, apply_vector) only runs when a ball carrier exists
+        and we're in OPEN_PLAY.  Tackle checks are also gated on
+        ``self.world.ball_carrier is not None`` and ``in_kickoff``.
+        """
+        self.world.frame_count += 1
+        self.world.dt = dt
+        self.world.defence_ran_this_frame = False
+
+        # â•â•â• SDEA phase invariants â€” set frozen flags BEFORE handler â•â•â•
+        apply_phase_invariants(self.world, self._phase)
+
+        # â•â•â• Defence + attack run only during open-play phases â•â•â•
+        # During TES phases (TACKLE_INIT/CONTACT/DRIVE/DOMINANCE), RELEASE,
+        # PTB_PREP/EXEC/PTB, and POST_RUCK_OPEN_PLAY, the defence/attack
+        # subsystems are suppressed â€” freeze is managed by apply_phase_invariants()
+        # and movement is handled by the phase handlers directly.
+        if self._phase in ("OPEN_PLAY", "POST_RUCK_OPEN_PLAY"):
+            self._update_defence(dt)
+            self._update_attack(dt)
+            self.world.defence_ran_this_frame = True
+
+        bc = self.world.ball_carrier
+        if bc is not None:
+            self.ball_carrier = bc
+            self.frames_since_ptb += 1
+        else:
+            self.ball_carrier = None
+
+        # Dispatch
+        phase_map = {
+            "OPEN_PLAY":             self._update_open_play,
+            "TACKLE_INIT":           self._update_tackle_init,
+            "TACKLE_CONTACT":        self._update_tackle_contact,
+            "TACKLE_DRIVE":          self._update_tackle_drive,
+            "TACKLE_DOMINANCE":      self._update_tackle_dominance,
+            "RELEASE":               self._update_release,
+            "PTB_PREP":              self._update_ptb_prep,
+            "PTB_EXEC":              self._update_ptb_exec,
+            "PTB":                   self._update_ptb,
+            "POST_RUCK_OPEN_PLAY":   self._update_post_ruck_open_play,
+        }
+        handler = phase_map.get(self._phase)
+        if handler:
+            handler(dt)
+        else:
+            # Safety fallback -- reset to open play
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "FALLBACK")
+
+        # â•â•â• FREEZE-STATE COMPLIANCE ENFORCEMENT â•â•â•
+        # After the phase handler runs, guarantee that any player with
+        # frozen=True has zero velocity and target pinned to current position.
+        # This prevents "soft-freeze" violations where frozen players have
+        # stale movement targets or non-zero velocity from TES-era state.
+        for p in self.world.players:
+            if p.frozen:
+                p.vx = 0.0
+                p.vy = 0.0
+                p.target_x = p.x
+                p.target_y = p.y
+
+        # â•â•â• POST-PTB SCOOT: advance marker freeze timer each frame â•â•â•
+        if self.world.marker_freeze_timer < self.world.marker_lock_duration_s:
+            self.world.marker_freeze_timer += dt
+        # Sync frames_since_ptb to world so AttackController reads the real value
+        self.world.frames_since_ptb = self.frames_since_ptb
+
+        # â•â•â• SDEA movement audit â€” log violations AFTER handler â•â•â•
+        violations = audit_movement(self.world, self._phase)
+        for v in violations:
+            print(f"[SDEA_MOVEMENT_VIOLATION] {v}")
+
+        # â•â•â• Freeze audit (debug diagnostics, every 10 frames) â•â•â•
+        self.freeze_audit.run(self.world, self.world.frame_count, self._phase, self._phase_timer)
+        # â•â•â• Defence reactivity audit (validates line-break response) â•â•â•
+        audit_defence_reactivity(self.world)
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # Phase helpers
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _set_phase(self, phase: str, sub_state: GameSubState, reason: str) -> None:
+        """Transition internal phase and set world sub_state."""
+        self._phase = phase
+        self._phase_timer = 0.0
+        # Reset PTB gate safety timeout on any phase entry
+        # (set high; decremented each frame in PTB phase handlers)
+        self._ptb_gate_override_frames = 999999
+        self.world.set_sub_state(sub_state, reason)
+
+        # -- UNFREEZE BC + RESET TARGETS ON OPEN-PLAY ENTRY --
+        # When transitioning into OPEN_PLAY or POST_RUCK_OPEN_PLAY, ensure BC
+        # is unfrozen and has valid targets so AttackController steering works.
+        if phase in ("OPEN_PLAY", "POST_RUCK_OPEN_PLAY"):
+            bc = self.world.ball_carrier
+            if bc is not None:
+                bc.frozen = False
+                bc.freeze_timer = 0.0
+                bc.target_x = bc.x
+                bc.target_y = bc.y
+                bc.move_speed = bc.max_speed_mps
+                print(f"[PHASE_ENTRY] BC unfrozen for {phase} id={bc.player_id}")
+
+        # -- POST-RUCK FRESH TARGET KICK --
+        # When transitioning from POST_RUCK_OPEN_PLAY to OPEN_PLAY, defenders
+        # may be parked on their last retreat line (e.g. ruck_x + 10) with
+        # target_x == current_x, causing the defence pipeline to see them as
+        # "already compliant" and never issue new movement orders.
+        #
+        # Fix: force every non-marker, non-DH defender to target the anchor
+        # line on the first OPEN_PLAY frame.  On subsequent frames the normal
+        # depth-classification/targeting pipeline will re-fine positions.
+        if phase == "OPEN_PLAY" and "POST_RUCK" in reason:
+            ruck_x = getattr(self.world, "ruck_x_m", 60.0)
+            anchor_x = ruck_x + self.def_tuners.def_line_depth_m
+            for d in self.world.defending_team:
+                if d.defender_role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B, DefenderRole.DUMMY_HALF):
+                    continue
+                # Set target to anchor so next defence frame has a non-zero delta
+                d.target_x = anchor_x
+                d.target_y = d.y
+                d.move_speed = d.max_speed_mps
+                d.freeze_timer = 0.0
+                # Clear any timing-stagger flags that may suppress movement
+                if hasattr(d, "timing_locked"):
+                    d.timing_locked = False
+                if hasattr(d, "reaction_timer"):
+                    d.reaction_timer = 0.0
+                if hasattr(d, "retreat_delay"):
+                    d.retreat_delay = 0.0
+    # -- Public entry point (called from catch_system after kickoff catch) --
+
+    def start(self, player: Player) -> None:
+        """Register ball carrier after kickoff catch.  No phase change --
+        the engine is already in OPEN_PLAY since boot."""
+        self.ball_carrier = player
+        self.world.game_state = GameWorldState.OPEN_PLAY
+        self.world.set_sub_state(GameSubState.OPEN_PLAY, "OpenPlayEngine.start()")
+        print(f"[OPEN_PLAY] start() registered Player #{player.player_id}")
+
+    # -- OPEN_PLAY ------------------------------------------------------
+
+    def _update_open_play(self, dt: float) -> None:
+        """Normal open play: BC runs, defence tracks, check for tackle initiation."""
+        # â•â•â• OPEN_PLAY role controller â€” MUST RUN BEFORE ANY FREEZE OR MOVEMENT â•â•â•
+        # Role fixing via apply_phase_invariants()
+
+        bc = self.ball_carrier
+        if bc is None:
+            return
+        bc.attack_role = "ball_carrier"
+
+        # Cooldown
+        if self._cooldown_timer > 0.0:
+            self._cooldown_timer -= dt
+
+        # Ensure BC has tuners
+        if bc.tuners is None:
+            bc.tuners = AttackTuners()
+
+        # BC steering is handled by _update_attack() which runs before dispatch
+        # in update().  No further attack pipeline needed here.
+
+        # [STEP-02A-01] Legacy tackle trigger disabled.
+        # Lvl-1 chase is now the sole authority for initiating tackles.
+
+    def _update_bc_run(self, bc: Player, dt: float) -> None:
+        """Ball carrier forward movement -- simple version."""
+        bc.vx = 5.0
+        bc.x += bc.vx * dt
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ATTACK UPDATE â€” gives all attackers movement targets every frame
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _update_attack(self, dt: float) -> None:
+        """Give every attacker movement targets each OPEN_PLAY/POST_RUCK_OPEN_PLAY frame.
+
+        Overrides any stale TES pinning.  BC is handled by attack_controller;
+        support runners get full X+Y vector movement toward the BC so they
+        converge with defenders' tackle corridors.
+        """
+        # â•â•â• HARD GATE: attack runs ONLY during OPEN_PLAY / POST_RUCK_OPEN_PLAY â•â•â•
+        # This catches all call paths including hidden/implicit call sites
+        # that bypass the gate in update().
+        if self._phase not in ("OPEN_PLAY", "POST_RUCK_OPEN_PLAY"):
+            return
+
+        bc = self.world.ball_carrier
+        if bc is None:
+            return
+
+        # â”€â”€ BC steering via AttackController â”€â”€
+        self.attack_controller.apply_vector(bc, self.world, dt)
+
+        # â”€â”€ CRITICAL: BC physics step resolves target_x/target_y into movement â”€â”€
+        bc.update(dt)
+
+        # â”€â”€ Support runners â”€â”€
+        for p in self.world.attacking_team:
+            if p is bc:
+                continue
+            # Support runners: move toward BC on both axes
+            dx = bc.x - p.x
+            dy = bc.y - p.y
+            dist = math.hypot(dx, dy)
+            if dist > 0.01:
+                speed = 4.0
+                p.vx = (dx / dist) * speed
+                p.vy = (dy / dist) * speed
+                p.target_x = p.x + p.vx * dt
+                p.target_y = p.y + p.vy * dt
+            else:
+                p.vx = 0.0
+                p.vy = 0.0
+            p.frozen = False
+            p.freeze_timer = 0.0
+            print(f"ATTACK UPDATE id={p.player_id} x={p.x:.2f} y={p.y:.2f} "
+                  f"vx={p.vx:.2f} vy={p.vy:.2f}")
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # STEPâ€‘03Aâ€‘08 â€” Defensive line anchor
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _compute_defensive_retreat_target(self, player):
+        """
+        STEP 3F: Retreat direction + target line.
+        Defenders retreat toward defensive_line_anchor after PTB.
+
+        Returns the X coordinate defenders should retreat to.
+        Clamp: if the defender is already past the line, stay put.
+        """
+        anchor = getattr(self.world, "defensive_line_anchor", None)
+        if anchor is None:
+            anchor = self.world.ruck_x_m + RETREAT_DISTANCE_M
+
+        if anchor < player.x:
+            return player.x
+        return anchor
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # LINE-BREAK HANDLING â€” when BC passes the defensive line
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _handle_line_break(self, bc: Player, dt: float) -> bool:
+        """Detect and react to a BC line break.
+
+        Condition: bc_x > defensive_line_anchor_x + line_break_threshold.
+        When triggered, switch all defenders to chase/scramble with
+        dynamic targets following the BC.
+
+        Returns True if line-break is active (handled here), False if
+        normal defence should proceed.
+        """
+        # Compute the defensive line anchor
+        defensive_anchor = getattr(self.world, "defensive_line_anchor", None)
+        if defensive_anchor is None:
+            ruck_x = self.world.ruck_x_m if self.world.ruck_x_m is not None else bc.x
+            defensive_anchor = ruck_x + self.def_tuners.def_line_depth_m
+
+        LINE_BREAK_THRESHOLD_M = 3.0  # BC must be 3m past anchor to trigger
+
+        bc_ahead = bc.x - defensive_anchor
+
+        if bc_ahead > LINE_BREAK_THRESHOLD_M:
+            if not self._line_break_active:
+                print(f"[LINE_BREAK] BC #{bc.player_id} x={bc.x:.1f} past anchor {defensive_anchor:.1f} by {bc_ahead:.1f}m")
+                self._line_break_active = True
+        else:
+            # Deactivate if BC drops back behind anchor
+            if self._line_break_active and bc_ahead < -1.0:
+                self._line_break_active = False
+                print(f"[LINE_BREAK] BC returned behind anchor â€” deactivating")
+
+        if not self._line_break_active:
+            return False
+
+        # â”€â”€ Line-break reaction: scramble/chase â”€â”€
+        defenders = self.world.defending_team
+        chase_speed = bc.max_speed_mps * 0.9 if hasattr(bc, "max_speed_mps") else 6.0
+        for d in defenders:
+            if d.defender_role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B, DefenderRole.DUMMY_HALF):
+                continue
+            # Target: behind the BC with lane-based lateral offset
+            d.target_x = bc.x - 2.0  # scramble depth behind BC
+            d.target_y = bc.y + (d.player_id % 3 - 1) * 3.0  # spread laterally
+            d.move_speed = chase_speed
+            d.frozen = False
+            d.freeze_timer = 0.0
+            # Reclassify as ACTIVE for chase behaviour
+            d.depth_class = "PRIMARY"
+            d.timing_locked = False
+            d.reaction_timer = 0.0
+            d.retreat_delay = 0.0
+
+        # Apply movement
+        for d in defenders:
+            d.update(dt)
+
+        return True
+
+    def _update_defence(self, dt):
+        # ═══════════════════════════════════════════════════════════════
+        # HARD GATE: defence runs ONLY during OPEN_PLAY / POST_RUCK_OPEN_PLAY
+        # ═══════════════════════════════════════════════════════════════
+        if self._phase not in ("OPEN_PLAY", "POST_RUCK_OPEN_PLAY"):
+            return
+
+        # ═══════════════════════════════════════════════════════════════
+        # FIX: assign default roles to any defender missing one
+        # ═══════════════════════════════════════════════════════════════
+        for p in self.world.defending_team:
+            if p.defender_role is None:
+                p.defender_role = DefenderRole.DEF_LINE_READY
+
+        bc = self.world.ball_carrier
+        if bc is None:
+            return
+
+        # ═══════════════════════════════════════════════════════════════
+        # DELEGATE TO DefensiveBehaviourUnified — the authoritative
+        # defensive targeting pipeline (geometry, governor, role spacing,
+        # decisions, pursuit mode, line break collapse).
+        #
+        # The OLD code bypassed this pipeline entirely by computing vx/vy
+        # directly toward BC, overriding width-based target_y every frame.
+        # Now defenders get width-distributed target_y from the pipeline.
+        #
+        # Player.update(dt) then resolves target_x/target_y into vx/vy.
+        # ═══════════════════════════════════════════════════════════════
+        defenders = [p for p in self.world.defending_team if not p.frozen]
+
+        # Compute the defensive line anchor and lane_y
+        ruck_x = getattr(self.world, "ruck_x_m", bc.x if bc else 60.0)
+        ruck_y = getattr(self.world, "ruck_y_m", bc.y if bc else 35.0)
+        anchor_x = getattr(self.world, "defensive_line_anchor", ruck_x + RETREAT_DISTANCE_M)
+
+        # Compute even Y-spread across def_line_width_m centred on ruck_y
+        def_line_width = getattr(self.world, "def_line_width_m", 40.0)
+        n = len(defenders)
+        lane_y = []
+        half_width = def_line_width * 0.5
+        for i in range(n):
+            if n > 1:
+                t = (i / (n - 1)) * 2.0 - 1.0  # -1..1
+            else:
+                t = 0.0
+            lane_y.append(ruck_y + t * half_width)
+
+        # Deferred D-series pending state (from PTB transitions)
+        if self._pending_anchor_x is not None:
+            anchor_x = self._pending_anchor_x
+            self._pending_anchor_x = None
+        if self._pending_spacing_y is not None:
+            ruck_y = self._pending_spacing_y
+            self._pending_spacing_y = None
+        if self._pending_retreat_reset:
+            self.defensive_line_manager.reset_retreat_state()
+            self._pending_retreat_reset = False
+
+        # Dispatch to DefensiveBehaviourUnified
+        self.def_behaviour.apply(self.world, defenders, anchor_x, lane_y)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Apply movement: each defender's Player.update(dt) resolves
+        # target_x/target_y set by the pipeline above.
+        # ═══════════════════════════════════════════════════════════════
+        for p in defenders:
+            if p.frozen:
+                continue
+            p.update(dt)
+
+        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
+        # Tackle trigger with pre-tackle check (MISS / ARM_GRAB / CONTACT)
+        # ═══════════════════════════════════════════════════════════════════
+        for p in defenders:
+            if p is bc:
+                continue
+            dist = math.hypot(bc.x - p.x, bc.y - p.y)
+            if dist < TACKLE_RADIUS_M:
+                pre_result = self._check_pre_tackle(bc, p)
+                if pre_result == "MISS":
+                    print(f"[PRE_TACKLE] MISS - defender {p.player_id} whiffs")
+                    continue
+                elif pre_result == "ARM_GRAB":
+                    print(f"[PRE_TACKLE] ARM_GRAB - defender {p.player_id} grabs, BC slowed")
+                    bc.vx *= 0.85
+                    bc.vy *= 0.85
+                    continue
+                elif pre_result == "GLANCING":
+                    print(f"[PRE_TACKLE] GLANCING - defender {p.player_id} hits at angle, BC displaced")
+                    # Lateral displacement — push BC sideways, no TES entry
+                    lateral_dir = 1.0 if bc.y > p.y else -1.0
+                    bc.y += 0.5 * lateral_dir
+                    bc.vy = lateral_dir * 2.0
+                    continue
+                else:
+                    print(f"[TACKLE] defender {p.player_id} hit BC at dist={dist:.2f}")
+                    self._start_tackle(p, bc)
+                    return
+
+    def _update_defenders_tes_phases(self, dt: float) -> None:
+        """
+        During TES phases: set roles and movement only.
+
+        FREEZE IS NOT SET HERE â€” ``apply_phase_invariants()`` is the sole
+        freeze authority now.  This method only:
+          - Assigns retreat targets for DEF_RETREAT_10 defenders
+          - Handles tackler engagement movement (pull-in, LERP, etc.)
+
+        RELEASE gate: TES shuts down during RELEASE.
+        """
+        print("_update_defenders_tes_phases FIRING phase=", self._phase)
+        if self._phase == "RELEASE":
+            return  # TES is dead during RELEASE
+
+        # â•â•â• Sustain: ensure non-BC attackers are suppressed every TES frame â•â•â•
+        # Even though _start_tackle() sets attack_role = "none" on entry,
+        # other subsystems (e.g. attack controller, defence, or state resets)
+        # may re-assign attack_role during TES phases.  Re-assert here so
+        # non-BC attackers always resolve to Role.NONE â†’ must_be_frozen.
+        bc = self.ball_carrier
+        if bc is not None:
+            for p in self.world.attacking_team:
+                if p is not bc:
+                    p.attack_role = "none"
+
+        # â”€â”€ Common: set retreat targets for DEF_RETREAT_10 defenders â”€â”€
+        # During TES phases, retreaters set target to ruck_x + 10
+        # but their frozen state is managed by apply_phase_invariants().
+        # (This section intentionally left sparse â€” frozen is handled elsewhere.)
+        pass
+
+    # -- Tackle initiation ----------------------------------------------
+
+    # [STEP-02A-01] _enter_tackle_approach disabled (was used only by _maybe_start_tackle).
+    # def _enter_tackle_approach(self, bc: Player, d: Player) -> None:
+    #     """Phase-4D-2: short pre-contact shaping before TES starts."""
+    #     self.bc_in_approach = True
+    #
+    #     dx = d.x - bc.x
+    #     dy = d.y - bc.y
+    #     dist = math.hypot(dx, dy)
+    #     if dist < 0.01:
+    #         return
+    #
+    #     # Direction toward tackler
+    #     nx = dx / dist
+    #     ny = dy / dist
+    #
+    #     # Reduce speed slightly (approach deceleration)
+    #     speed = math.hypot(bc.vx, bc.vy)
+    #     speed *= 0.75  # soften approach
+    #
+    #     bc.vx = nx * speed
+    #     bc.vy = ny * speed
+
+
+    def _check_pre_tackle(self, bc, defender) -> str:
+        """Pre-tackle check: returns 'MISS', 'ARM_GRAB', or 'CONTACT'.
+
+        Evaluates defender approach angle and relative speed to determine
+        whether the defender makes solid contact, an arm-grab, or whiffs entirely.
+        """
+        dx = bc.x - defender.x
+        dy = bc.y - defender.y
+        dist = math.hypot(dx, dy)
+        if dist < 0.01:
+            return "CONTACT"  # too close to miss
+
+        # Defender approach direction
+        def_spd = math.hypot(defender.vx, defender.vy)
+        if def_spd > 0.1:
+            def_dx = defender.vx / def_spd
+            def_dy = defender.vy / def_spd
+        else:
+            def_dx = math.cos(defender.facing)
+            def_dy = math.sin(defender.facing)
+
+        # Direction from defender to BC
+        to_bc_dx = dx / dist
+        to_bc_dy = dy / dist
+
+        # Dot product: 1.0 = head-on, 0.0 = side-on, -1.0 = chasing away
+        dot = def_dx * to_bc_dx + def_dy * to_bc_dy
+
+        # Relative speed: defender must have speed advantage for solid contact
+        bc_spd = math.hypot(bc.vx, bc.vy)
+        rel_speed = def_spd - bc_spd * 0.5
+
+        # Composite tackle score (0..1)
+        angle_score = (dot * 0.5 + 0.5)  # 0.0 (worst) to 1.0 (head-on)
+        speed_score = max(0.0, min(1.0, rel_speed / 10.0))
+        tackle_score = angle_score * 0.6 + speed_score * 0.4
+
+        MISS_THRESHOLD = 0.3
+        ARM_GRAB_THRESHOLD = 0.6
+        GLANCING_THRESHOLD = 0.75
+
+        if tackle_score < MISS_THRESHOLD:
+            return "MISS"
+        elif tackle_score < ARM_GRAB_THRESHOLD:
+            return "ARM_GRAB"
+        elif tackle_score < GLANCING_THRESHOLD:
+            return "GLANCING"
+        else:
+            return "CONTACT"
+
+    def _check_broken_tackle_scoring(self, ctx, outcome) -> bool:
+        """Check if BC overpowers the defender based on computed dominance.
+
+        Returns True for a broken tackle: BC momentum >> defender momentum
+        AND the outcome is WEAK (attacker winning the dominance battle).
+        """
+        from game.tes.tes_state import TackleResult
+        bc_mom = ctx.attacker.mass * ctx.attacker.speed
+        def_mom = ctx.engagement.total_momentum()
+        if def_mom <= 0:
+            def_mom = bc_mom * 0.3  # treat as very weak resistance
+
+        # Broken if BC momentum > 1.5x defender momentum AND outcome is WEAK
+        if bc_mom > def_mom * 1.5 and outcome.tackle_result == TackleResult.WEAK:
+            return True
+        return False
+
+    def _handle_broken_tackle(self):
+        """Broken tackle: defender falls, BC continues in OPEN_PLAY.
+
+        No RELEASE, no PTB, no ruck formed.  The BC gets a slight speed
+        penalty but remains in open play.  The defender(s) go to ground.
+        """
+        bc = self.ball_carrier
+        d = self.primary
+
+        # BC: slight speed penalty, continues in open play
+        if bc:
+            bc.vx *= 0.9
+            bc.vy *= 0.9
+            bc.tes_locked = False
+            bc.in_contact = False
+            bc.anim_state = ""
+
+        # Primary defender: falls (frozen for 1 second on ground)
+        if d:
+            d.frozen = True
+            d.freeze_timer = 1.0  # stays on ground for 1s
+            d.is_tackler = False
+            d.in_contact = False
+            d.tes_locked = False
+            d.anim_state = "FALLEN"
+
+        # Joiners released
+        for j in self.joiners:
+            j.tes_locked = False
+            j.in_contact = False
+            j.is_tackler = False
+
+        # Reset TES state
+        self.tes_ctx = None
+        self.tes_outcome = None
+        self.world.tes_active = False
+        self.primary = None
+        self.joiners.clear()
+        # Reset broken-check flag for next tackle cycle
+        self._broken_checked_this_contact = False
+        # Clear dominance-computed flag if present
+        if hasattr(self, '_dominance_computed_for_broken'):
+            del self._dominance_computed_for_broken
+
+        # Return to OPEN_PLAY - no RELEASE, no PTB, no ruck
+        self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "BROKEN_TACKLE")
+        print(f"[BROKEN_TACKLE] BC #{bc.player_id if bc else '?'} breaks tackle - back to OPEN_PLAY")
+
+    def _prepare_bc_dh_for_tackle(self):
+        """
+        STEP 4A: Pre-tackle movement reset.
+
+        No speed/velocity clamping — physics values are preserved so
+        TES compute_drive_distance() receives real momentum deltas.
+        Called at the start of _start_tackle() before any TES entry logic.
+        """
+        bc = self.ball_carrier
+        dh = self.dh
+
+        if bc is not None:
+            # Clear sprint/chase flags if they exist (safe hasattr guard)
+            if hasattr(bc, "is_sprinting"):
+                bc.is_sprinting = False
+            if hasattr(bc, "is_chasing"):
+                bc.is_chasing = False
+
+        # DH is IMMUNE to tackle-initiation repositioning.
+        # DH position/velocity is managed solely by the attack controller
+        # and PTBManager.  No defensive or tackle-prep code may touch it.
+
+    # [STEP-02A-01] _maybe_start_tackle disabled.
+    # Lvl-1 chase now calls _start_tackle() directly after pre-tackle logic.
+    # def _maybe_start_tackle(self, bc: Player) -> None:
+    #     """Check proximity and angle to start a tackle."""
+    #     if self._phase != "OPEN_PLAY":
+    #         return
+    #
+    #     closest = None
+    #     cd = 9999.0
+    #     for d in self.world.defending_team:
+    #         if d.defender_role == DefenderRole.DUMMY_HALF:
+    #             continue
+    #         dist = math.hypot(bc.x - d.x, bc.y - d.y)
+    #         if dist < cd:
+    #             cd = dist
+    #             closest = d
+    #
+    #     if closest is None:
+    #         return
+    #     if cd > TACKLE_RADIUS_M:
+    #         return
+    #     if _approach_angle(bc, closest) > TACKLE_ANGLE_THRESHOLD_DEG:
+    #         return
+    #
+    #     # Phase-4D-2: enter tackle approach for one frame
+    #     self._enter_tackle_approach(bc, closest)
+    #
+    #     # Phase-4D-1: momentum lock
+    #     self._lock_bc_momentum_for_tackle(bc, closest)
+    #
+    #     # Initiate tackle
+    #     self.bc_in_approach = False
+    #     self._start_tackle(bc, closest)
+
+    def _start_tackle(self, bc: Player, d: Player) -> None:
+        """Create TES context and enter TACKLE_INIT.
+
+        Per spec 3.2 + 3.3:
+          1. primary_defender â†’ TACKLER_1
+          2. Scan for immediate-near defenders â†’ TACKLER_2, TACKLER_3
+          3. ALL OTHER defenders â†’ DEF_RETREAT_10 immediately
+
+        Delegates TES entry physics to tes_start_tackle().
+        """
+        # STEP 4A: stabilise BC/DH before TES â€” clamp speed, clear sprint/chase flags
+        self._prepare_bc_dh_for_tackle()
+
+
+        self.primary = d
+        self.joiners = []
+
+        # Delegate all TES entry setup to the central function
+        ctx = tes_start_tackle(bc, d, self.world)
+
+        self.tes_ctx = ctx
+        self.tes_outcome = TESOutcome()
+
+        # â”€â”€ Spec 3.2: Assign tackler roles â”€â”€
+        d.defender_role = DefenderRole.TACKLER_1
+        # d.is_tackler already True from tes_start_tackle()
+        # Freeze set by apply_phase_invariants() - TACKLER_1 frozen in TES
+
+        # Spec 3.2: Scan for TACKLER_2 and TACKLER_3 (within 2.5m of BC)
+        TACKLE_JOIN_DISTANCE = 2.5
+        immediate_joiners = []
+        for candidate in self.world.defending_team:
+            if candidate is d:
+                continue
+            if candidate.defender_role == DefenderRole.DUMMY_HALF:
+                continue
+            dist = math.hypot(candidate.x - bc.x, candidate.y - bc.y)
+            if dist <= TACKLE_JOIN_DISTANCE:
+                immediate_joiners.append((dist, candidate))
+
+        immediate_joiners.sort(key=lambda x: x[0])  # closest first
+        for rank, (_, j) in enumerate(immediate_joiners[:2]):  # max 2 more
+            if rank == 0:
+                j.defender_role = DefenderRole.TACKLER_2
+            else:
+                j.defender_role = DefenderRole.TACKLER_3
+            j.is_tackler = True
+            j.in_contact = True
+            j.tes_locked = True
+            self.joiners.append(j)
+            # Also register in TES engagement
+            j_ctx = _make_ctx(j)
+            ctx.engagement.add(j_ctx, self.world.sim_time_s)
+
+        # â”€â”€ Spec 3.3: All other defenders â†’ DEF_RETREAT_10 immediately â”€â”€
+        TACKLER_ROLES = frozenset({
+            DefenderRole.TACKLER_1,
+            DefenderRole.TACKLER_2,
+            DefenderRole.TACKLER_3,
+        })
+        # MARKER_ROLES REMOVED (July 2026):
+        # Old markers must NOT be preserved through the next tackle cycle.
+        # They are now cleared and reassigned fresh in _prepare_release()
+        # via _assign_markers_for_new_tackle().
+        for defender in self.world.defending_team:
+            if defender.defender_role in TACKLER_ROLES:
+                continue
+            if defender.defender_role == DefenderRole.DUMMY_HALF:
+                continue
+            # Not a tackler â†’ DEF_RETREAT_10 (includes old markers)
+            defender.defender_role = DefenderRole.DEF_RETREAT_10
+
+        # â•â•â• Suppress non-BC attackers during TES â•â•â•
+        # Support runners, first receivers, and any other attacker who is
+        # not the ball carrier must resolve to Role.NONE â†’ must_be_frozen.
+        # This prevents freeze violations where `_update_attack()` or other
+        # systems try to move them during TES phases.
+        for p in self.world.attacking_team:
+            if p is not bc:
+                p.attack_role = "none"
+
+        # Ensure ball ownership is BC (belt + suspenders)
+        self.world.ball_owner = "BC"
+
+        self._set_phase("TACKLE_INIT", GameSubState.TACKLE_INIT, "TACKLE_INIT")
+
+    # -- TACKLE_INIT ----------------------------------------------------
+
+    def _update_tackle_init(self, dt: float) -> None:
+        """First contact frame -- defender closes to BC, then enter contact."""
+        self._phase_timer += dt
+
+        # Section D: update defender bubble/freeze for TES phase
+        self._update_defenders_tes_phases(dt)
+
+        bc = self.ball_carrier
+        d = self.primary
+        if bc is None or d is None:
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "TACKLE_INIT_ABORT")
+            return
+
+        # Pull defender toward BC
+        dx = bc.x - d.x
+        dy = bc.y - d.y
+        dist = math.hypot(dx, dy)
+        if dist > 0.6:
+            spd = 3.0
+            d.vx = (dx / dist) * spd
+            d.vy = (dy / dist) * spd
+            d.x += d.vx * dt
+            d.y += d.vy * dt
+
+        # Transition after brief engagement window
+        if self._phase_timer >= 0.10:
+            self._set_phase("TACKLE_CONTACT", GameSubState.TACKLE_CONTACT, "TACKLE_INIT->TACKLE_CONTACT")
+
+    def _maybe_add_joiners(self) -> None:
+        """Add secondary tacklers during CONTACT phase."""
+        bc = self.ball_carrier
+        if bc is None:
+            return
+
+        for p in self.world.defending_team:
+            if p is self.primary:
+                continue
+            if p.frozen:
+                continue
+            if p.in_contact:
+                continue
+
+            dx = bc.x - p.x
+            dy = bc.y - p.y
+            dist = (dx * dx + dy * dy) ** 0.5
+
+            # Joiner radius (same as original TES: TACKLE_RADIUS_M * 2)
+            if dist < TACKLE_RADIUS_M * 2.0:
+                p.in_contact = True
+                p.is_tackler = True
+                self.joiners.append(p)
+
+    # -- TACKLE_CONTACT -------------------------------------------------
+
+    def _update_tackle_contact(self, dt: float) -> None:
+        """Contact phase: update waveform, check for joiners."""
+        self._phase_timer += dt
+
+        # Section D: update defender bubble/freeze for TES phase
+        self._update_defenders_tes_phases(dt)
+
+        bc = self.ball_carrier
+        d = self.primary
+        if bc is None or d is None:
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "TACKLE_CONTACT_ABORT")
+            return
+
+        if self.tes_ctx is not None:
+            # Refresh context snapshots
+            self.tes_ctx.attacker = _make_ctx(bc)
+            self.tes_ctx.defender = _make_ctx(d)
+            # Update waveform (TES runs here)
+            update_waveform(self.tes_ctx, self.rng)
+            # Spec 7.1: Check for break-tackle (BC overpowering defenders)
+            if self._check_break_tackle(dt):
+                return
+            # Check for additional tacklers joining
+            self._maybe_add_joiners()
+
+        if self._phase_timer >= 0.15:
+            self._set_phase("TACKLE_DRIVE", GameSubState.TACKLE_DRIVE, "TACKLE_CONTACT->TACKLE_DRIVE")
+        if self.tes_ctx is not None:
+            # Refresh context snapshots
+            self.tes_ctx.attacker = _make_ctx(bc)
+            self.tes_ctx.defender = _make_ctx(d)
+            # Update waveform (TES runs here)
+            update_waveform(self.tes_ctx, self.rng)
+            # Spec 7.1: Check for break-tackle (BC overpowering defenders)
+            if self._check_break_tackle(dt):
+                return
+            # Check for broken tackle using scoring system
+            if not hasattr(self, '_broken_checked_this_contact'):
+                compute_dominance(self.tes_ctx, self.tes_outcome, self.rng)
+                self._broken_checked_this_contact = True
+            if self._check_broken_tackle_scoring(self.tes_ctx, self.tes_outcome):
+                self._handle_broken_tackle()
+                return
+            # Check for additional tacklers joining
+            self._maybe_add_joiners()
+        ctx = self.tes_ctx
+
+        # Gate: secondary registration not allowed until TES lock completes
+        if not ctx.joiner_gate_open:
+            return
+
+        engaged = ctx.engaged_tacklers
+        if len(engaged) >= ctx.max_joiners:
+            return
+
+        bc = self.ball_carrier
+        if bc is None:
+            return
+        bc_ctx = _make_ctx(bc)
+        engaged_ctx = [ctx.engagement.tacklers[i] for i in engaged]
+
+        for d in self.world.defending_team:
+            if d is self.primary:
+                continue
+            if d.player_id in engaged:
+                continue
+            if d.defender_role == DefenderRole.DUMMY_HALF:
+                continue
+
+            cand = _make_ctx(d)
+            if can_join(cand, bc_ctx, engaged_ctx):
+                ctx.engagement.add(cand, self.world.sim_time_s if hasattr(self.world, "sim_time_s") else 0.0)
+                self.joiners.append(d)
+                engaged_ctx.append(cand)
+                if len(ctx.engaged_tacklers) >= ctx.max_joiners:
+                    break
+
+    # -- TACKLE_DRIVE ---------------------------------------------------
+
+    def _update_tackle_drive(self, dt: float) -> None:
+        """Drive phase: LERP-based drive movement.
+
+        On the first frame: compute dominance/distance/duration and
+        initialise the LERP snapshot ``drive_target_x``.
+
+        Each subsequent frame: advance the elapsed drive timer and
+        interpolate BC, primary, and joiner X positions from their
+        DRIVE-entry snapshots to the target.  When the LERP completes
+        (t >= 1.0), transition to TACKLE_DOMINANCE.
+
+        NOTE: ruck_x_m is NOT written here â€” it is an immutable snapshot
+        written only during _prepare_release() at the DOMINANCE->RELEASE
+        boundary.
+        """
+        bc = self.ball_carrier
+        d = self.primary
+        if bc is None or d is None or self.tes_ctx is None or self.tes_outcome is None:
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "TACKLE_DRIVE_ABORT")
+            return
+
+        ctx = self.tes_ctx
+
+        # Section D: update defender bubble/freeze for TES phase
+        self._update_defenders_tes_phases(dt)
+
+        # First frame of drive: compute all metrics, set up LERP targets
+        if self._phase_timer == 0.0:
+            compute_dominance(ctx, self.tes_outcome, self.rng)
+            compute_drive_distance(ctx, self.tes_outcome, self.rng)
+            compute_tackle_duration(ctx, self.tes_outcome, self.rng)
+            compute_ptb_time(ctx, self.tes_outcome, self.rng)
+
+            # --- 2D DRIVE: decompose signed drive distance into X/Y components ---
+            # Use approach_angle_deg (already computed at TES entry) to give
+            # drive a lateral component based on the defender's approach vector.
+            drive_mag_signed = self.tes_outcome.drive_distance_m
+            drive_mag_abs = abs(drive_mag_signed)
+            approach_rad = math.radians(ctx.approach_angle_deg)
+            dir_x = math.cos(approach_rad)
+            dir_y = math.sin(approach_rad)
+
+            # Signed X drive: positive = forward (team_attack_dir), negative = backward
+            # The sign of drive_mag_signed already encodes dominance direction
+            # via compute_drive_distance(): positive = defender drives BC forward,
+            # negative = defender drives BC backward (relative to attack dir).
+            # Use the signed value for X so direction respects who won the collision.
+            ctx.drive_target_x = ctx.drive_start_x + drive_mag_signed * dir_x * ctx.team_attack_dir
+            # Y drive is always absolute magnitude — lateral direction from dir_y
+            ctx.drive_target_y = ctx.bc_y0 + drive_mag_abs * dir_y
+
+            # Initialise elapsed --- first frame is zero so BC stays at bc_x0
+            ctx.drive_elapsed_s = 0.0
+
+            # Snapshot joiner starting positions (addressed by player_id)
+            # so each joiner can LERP individually during the drive.
+            self._joiner_x0: dict[int, float] = {}
+            self._joiner_y0: dict[int, float] = {}
+            for j in self.joiners:
+                self._joiner_x0[j.player_id] = j.x
+                self._joiner_y0[j.player_id] = j.y
+
+        self._phase_timer += dt
+
+        # Advance the LERP timer
+        ctx.drive_elapsed_s += dt
+        dur = max(0.1, self.tes_outcome.tackle_duration_s)
+        t = max(0.0, min(1.0, ctx.drive_elapsed_s / dur))
+
+        # ---- 2D LERP positions (BC gets X+Y, defender/joiners get X+Y) ----
+        bc.x = ctx.bc_x0 + (ctx.drive_target_x - ctx.bc_x0) * t
+        bc.y = ctx.bc_y0 + (ctx.drive_target_y - ctx.bc_y0) * t
+        # Primary tackler: track BC in X (offset behind) and Y (same lateral)
+        d.x = ctx.def_x0 + ((ctx.drive_target_x - 0.5) - ctx.def_x0) * t
+        d.y = ctx.def_y0 + (ctx.drive_target_y - ctx.bc_y0) * t
+        for j in self.joiners:
+            j_x0 = self._joiner_x0.get(j.player_id, j.x)
+            j_y0 = self._joiner_y0.get(j.player_id, j.y)
+            j.x = j_x0 + ((ctx.drive_target_x - 0.3) - j_x0) * t
+            j.y = j_y0 + (ctx.drive_target_y - ctx.bc_y0) * t
+
+        # Spec 7.1: Check for break-tackle during drive (raw momentum check)
+        if self._check_break_tackle(dt):
+            return
+        # Spec 7.1: Check for broken tackle using scoring system (re-evaluated each frame)
+        if self.tes_ctx is not None and self.tes_outcome is not None:
+            compute_dominance(self.tes_ctx, self.tes_outcome, self.rng)
+            if self._check_broken_tackle_scoring(self.tes_ctx, self.tes_outcome):
+                self._handle_broken_tackle()
+                return
+        # Transition when LERP completes
+        if t >= 1.0:
+            # ruck_x_m is NOT written here â€” it belongs in _prepare_release()
+            self._set_phase("TACKLE_DOMINANCE", GameSubState.TACKLE_DOMINANCE, "TACKLE_DRIVE->TACKLE_DOMINANCE")
+
+    # -- TACKLE_DOMINANCE -----------------------------------------------
+
+    def _update_tackle_dominance(self, dt: float) -> None:
+        """Dominance phase: run outcome checks, then release."""
+        self._phase_timer += dt
+
+        # Section D: update defender bubble/freeze for TES phase
+        self._update_defenders_tes_phases(dt)
+
+        if self.tes_ctx is not None and self.tes_outcome is not None:
+            check_offload(self.tes_ctx, self.tes_outcome, self.rng)
+            check_strip(self.tes_ctx, self.tes_outcome, self.rng)
+            check_fumble(self.tes_ctx, self.tes_outcome, self.rng)
+            check_penalty(self.tes_ctx, self.tes_outcome, self.rng)
+            check_six_again(self.tes_ctx, self.tes_outcome, self.rng)
+            check_line_break(self.tes_ctx, self.tes_outcome, self.rng)
+
+        # Spec 7.1: Check for break-tackle during dominance (raw momentum check)
+        if self._check_break_tackle(dt):
+            return
+        # Spec 7.1: Check for broken tackle using scoring system (re-evaluated each frame)
+        if self.tes_ctx is not None and self.tes_outcome is not None:
+            compute_dominance(self.tes_ctx, self.tes_outcome, self.rng)
+            if self._check_broken_tackle_scoring(self.tes_ctx, self.tes_outcome):
+                self._handle_broken_tackle()
+                return
+        if self._phase_timer >= 0.25:
+            # =========================================================
+            # DOMINANCE -> RELEASE: TES shuts down, DH assigned
+            # =========================================================
+            self._prepare_release()
+            self._just_entered_release = True
+            self._set_phase("RELEASE", GameSubState.TACKLE_RELEASE, "TACKLE_DOMINANCE->RELEASE")
+
+    def _prepare_release(self) -> None:
+        """Set up ruck position and assign dummy half on DOMINANCE->RELEASE.
+
+        Per spec 4.1 (Marker Assignment):
+          - TACKLER_1 â†’ MARKER_A
+          - TACKLER_2 â†’ MARKER_B
+          - TACKLER_3 + any extras â†’ DEF_RETREAT_10 (never markers)
+          - All other DEF_RETREAT_10 defenders stay in retreat
+
+        Engine-Spec X-Axis Marker Alignment:
+          - Markers are assigned roles but NOT frozen â€” they will be unfrozen
+            immediately at RELEASE entry so they can move to X-axis positions.
+          - Marker A target: (ruck_x + 1, ruck_y)
+          - Marker B target: (ruck_x + 2, ruck_y)
+          - No Y-offsets are used.
+
+        (Section B) TES stays active through RELEASE â€” tes_active is cleared
+        at the END of _update_release() and in _reset_tackle_state().
+        Player tes_locks are cleared here so players can move during RELEASE.
+
+        OPE's self.joiners is the authoritative tracking â€” no scanning of
+        world.players for "tackle_role" attribute.
+        """
+        bc = self.ball_carrier
+        if bc is None:
+            return
+        bc.attack_role = "ball_carrier"
+
+        # â•â•â• Clear player TES locks (so players can move during RELEASE) â•â•â•
+        if bc is not None:
+            bc.tes_locked = False
+        if self.primary is not None:
+            self.primary.tes_locked = False
+        for j in self.joiners:
+            j.tes_locked = False
+
+        # Record ruck position at BC's location
+        self.world.ruck_x_m = bc.x
+        self.world.ruck_y_m = bc.y
+
+        # â•â•â• Capture PTB anchor at true contact point (inline, no obsolete function) â•â•â•
+        self.world.ptb_anchor_x = bc.x
+        self.world.ptb_anchor_y = bc.y
+        self.world.last_contact_x = bc.x
+        self.world.last_contact_y = bc.y
+
+        # â”€â”€ Spec 4.1: Fresh marker assignment per tackle cycle â”€â”€
+        # Delegates to dedicated method that clears old markers, applies
+        # the 3-case rugby-league rule (tacklers -> closest -> default),
+        # and sets targets + temporary freeze (unfrozen in _update_release).
+        self._assign_markers_for_new_tackle()
+
+        # STEP 4 â€” Update anchor every time ruck_x_m changes
+        self.world.defensive_line_anchor = self.world.ruck_x_m + 10.0
+
+        # Assign DH from attacking team (closest to ruck who is NOT the BC)
+        self.dh = self._find_dh(self.world.attacking_team, bc.x, bc.y, bc)
+
+        if self.dh is not None:
+            self.dh.defender_role = DefenderRole.DUMMY_HALF
+            # Frozen state managed by apply_phase_invariants() â€” not set here
+            self.dh.tackle_locked = False
+
+        # P13: Clear OPE tackler references so they don't leak into next cycle.
+        # Markers stay frozen via _update_defence() logic, not via
+        # self.primary/joiners referencing.
+        self.joiners.clear()
+        self.primary = None
+
+    @staticmethod
+    def _find_dh(team: list, ruck_x: float, ruck_y: float, bc: Player) -> Player | None:
+        """Return the closest player to the ruck who is NOT the BC (Dummy Half)."""
+        candidates = [p for p in team if p is not bc]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda p: (p.x - ruck_x) ** 2 + (p.y - ruck_y) ** 2,
+        )
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # D1/D2 â€” Marker Peel Alignment
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _trigger_marker_peel(self) -> None:
+        """Unfreeze markers and tacklers at PTB completion.
+
+        Called when PTBManager.state == "complete", signalling that the
+        ball has been transferred from the tackled BC to the DH.
+
+        Clears MARKER_A, MARKER_B, TACKLER_1, and TACKLER_2 roles:
+          - Role set to None so the defence system reclassifies them
+          - frozen set to False so they can move into the line
+          - suppressed cleared (attribute may not exist â€” hasattr guard)
+          - marker_offside cleared
+
+        D1: Trigger marker peel when PTB completes.
+        D2: Also clear TACKLER_1 and TACKLER_2 roles (tacklers already
+            released; this is belt-and-suspenders).
+        """
+        # NOTE: marker_freeze_timer and p.frozen are NOT cleared here.
+        # apply_phase_invariants() is the sole freeze authority.
+        # The per-player freeze timer is managed by _update_post_ruck_open_play().
+        for p in self.world.defending_team:
+            if p.defender_role in (
+                DefenderRole.MARKER_A,
+                DefenderRole.MARKER_B,
+                DefenderRole.TACKLER_1,
+                DefenderRole.TACKLER_2,
+            ):
+                p.defender_role = None
+                if hasattr(p, "suppressed"):
+                    p.suppressed = False
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # P1 â€” PTB_PREP Gate: DH readiness check
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _check_dh_ready_for_ptb(self, for_exec: bool = False) -> bool:
+        """Check whether the DH is fully positioned and stable for PTB.
+
+        Used to gate RELEASE â†’ PTB_PREP and PTB_PREP â†’ PTB_EXEC transitions.
+        All conditions must pass before PTB can begin.
+
+        Args:
+            for_exec: If True, applies stricter velocity threshold (PTB_EXEC gate).
+
+        Returns:
+            True if DH is ready for PTB, False otherwise.
+        """
+        dh = self.dh
+        bc = self.world.ball_carrier
+        phase = self._phase
+
+        # 1. DH must exist
+        if dh is None:
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: DH is None â€” blocking")
+            return False
+
+        # 2. BC must exist
+        if bc is None:
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: BC is None â€” blocking")
+            return False
+
+        ruck_y = getattr(self.world, "ruck_y_m", bc.y)
+
+        # 3. DH must be behind BC (allow slight forward offset with hysteresis)
+        min_behind_x = bc.x + 0.3  # allow DH slightly ahead
+        if dh.x >= min_behind_x:
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: DH x={dh.x:.2f} >= bc.x+0.3={min_behind_x:.2f} â€” blocking")
+            return False
+
+        # 4. DH must be within 1m Â± tolerance behind BC (relaxed tolerance)
+        target_x = bc.x - DH_BEHIND_DISTANCE_M
+        pos_tolerance = DH_POSITION_TOLERANCE_M + 0.1  # relaxed to 0.4m
+        if abs(dh.x - target_x) > pos_tolerance:
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: DH dist to 1m target={abs(dh.x - target_x):.2f} > {pos_tolerance:.2f} â€” blocking")
+            return False
+
+        # 5. DH lateral offset from ruck_y (relaxed tolerance)
+        lateral_tolerance = DH_LATERAL_TOLERANCE_M + 0.3  # relaxed to 0.6m
+        if abs(dh.y - ruck_y) > lateral_tolerance:
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: DH lateral offset={abs(dh.y - ruck_y):.2f} > {lateral_tolerance:.2f} â€” blocking")
+            return False
+
+        # 6. DH velocity magnitude must be below stability threshold
+        vel_threshold = (DH_VELOCITY_STABLE_EXEC_THRESHOLD_MPS
+                         if for_exec
+                         else DH_VELOCITY_STABLE_THRESHOLD_MPS)
+        dh_speed = math.hypot(dh.vx, dh.vy)
+        if dh_speed > vel_threshold:
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: DH speed={dh_speed:.2f} > {vel_threshold:.2f} â€” blocking")
+            return False
+
+        # 7. DH must not be frozen
+        if dh.frozen:
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: DH frozen=True â€” blocking")
+            return False
+
+        # 8. DH must not be a tackler or marker
+        if dh.defender_role in (
+            DefenderRole.TACKLER_1,
+            DefenderRole.TACKLER_2,
+            DefenderRole.TACKLER_3,
+            DefenderRole.MARKER_A,
+            DefenderRole.MARKER_B,
+        ):
+            if self.world.frame_count % 30 == 0:
+                print(f"[PTB_GATE] {phase}: DH role={dh.defender_role} â€” blocking")
+            return False
+
+        return True
+
+    # -- RELEASE --------------------------------------------------------
+
+    def _update_release(self, dt: float) -> None:
+        """
+        Release phase: PTB wind-up timer.
+
+        TES is fully shut down -- no containment, no retreat, no tackle freeze.
+        DH is unfrozen with DefenderRole.DUMMY_HALF.
+
+        Engine-Spec X-Axis Marker Alignment:
+          - Markers unfreeze immediately on RELEASE entry.
+          - They begin moving toward their X-axis positions (ruck_x + 1, ruck_y)
+            for Marker A and (ruck_x + 2, ruck_y) for Marker B.
+          - TES/PTBManager do not control marker movement.
+        """
+        bc = self.world.ball_carrier
+        if bc is not None:
+            bc.attack_role = "ball_carrier"
+        print("_update_release FIRING phase=", self._phase, "timer=", self._phase_timer)
+
+        # â•â•â• DETACH ALL TACKLERS IMMEDIATELY ON RELEASE ENTRY â•â•â•â•â•â•â•
+        # BC must be freed from all tackle constraints before timer can
+        # advance, markers can move, or any PTB transition can occur.
+        if self._just_entered_release:
+            # â•â•â• WIPE ALL TES ARTEFACTS FIRST â•â•â•
+            # This clears movement targets, freeze flags, soft-freeze counters,
+            # retreat targets, defensive line anchors, and tes_active â€” ensuring
+            # RELEASE starts with a completely clean slate.
+            self._clear_tes_artefacts()
+
+            bc = self.ball_carrier
+            if bc is not None:
+                bc.in_contact = False
+                bc.tackle_locked = False
+                bc.tes_locked = False
+                bc.apply_physics_forces = False
+                # Clear any physics constraint/force flags that may exist
+                if hasattr(bc, "tackle_constraints_active"):
+                    bc.tackle_constraints_active = False
+                if hasattr(bc, "tackle_forces_active"):
+                    bc.tackle_forces_active = False
+                # Clear velocity from tackle to allow standing up
+                bc.vx = 0.0
+                bc.vy = 0.0
+                # BC recovery: stand up and move backward from the ruck
+                ruck_x = self.world.ruck_x_m if self.world.ruck_x_m is not None else bc.x
+                ruck_y = self.world.ruck_y_m if self.world.ruck_y_m is not None else bc.y
+                recovery_dir = -self.world.attacking_direction  # opposite of attack direction
+                bc.target_x = ruck_x + recovery_dir * RECOVERY_BACKWARD_DISTANCE_M
+                bc.target_y = ruck_y
+                bc.move_speed = RELEASE_RECOVERY_SPEED_MPS      # e.g. 1.5 m/s
+            # Clean sweep: every defender loses ALL tackle flags
+            # CRITICAL: Do NOT clear apply_physics_forces here â€” that would
+            # disable normal movement for ALL defenders (including markers)
+            # for the entire RELEASE phase until _reset_tackle_state() runs.
+            for p in self.world.defending_team:
+                p.is_tackler = False
+                p.in_contact = False
+                p.tackle_locked = False
+                p.tes_locked = False
+                # apply_physics_forces intentionally NOT touched â€” must stay True
+                # p.frozen NOT set here â€” apply_phase_invariants() is the sole freeze authority
+            self._just_entered_release = False
+            print(f"[DETACH] Clean sweep â€” all defenders detached at RELEASE entry")
+            # â•â•â• Per-frame enforcement: clear any lingering tackle flags during RELEASE â•â•â•
+            # Some subsystems (TES engagement, marker logic) may re-set tackler flags
+            # even after the first-frame detach.  Enforce cleared state every frame.
+            # CRITICAL: Do NOT set p.frozen = False here â€” the RELEASE freeze controller
+            # (ai_tes_controller with phase="RELEASE" -> _enforce_release_freeze) handles
+            # freeze state correctly for each role.  Overriding freeze here would allow
+            # non-mover roles (DEF_LINE_READY, DEF_CHASE, ATT_SUPPORT) to move during RELEASE.
+            for p in self.world.defending_team:
+                if p.is_tackler or p.in_contact or p.tackle_locked or p.tes_locked:
+                    p.is_tackler = False
+                    p.in_contact = False
+                    p.tackle_locked = False
+                    p.tes_locked = False
+                    # apply_physics_forces intentionally NOT touched â€” must stay True
+                    # so markers and all defenders can move during RELEASE
+                    # p.frozen intentionally NOT set here â€” freeze controlled by
+                    # ai_tes_controller("RELEASE") at end of _update_release()
+
+        self._phase_timer += dt
+
+        # â•â•â• RELEASE Protection Gate â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Hard minimum-duration wall: markers need time to reach X-axis
+        # targets (ruck_x+1 for MARKER_A, ruck_x+2 for MARKER_B).
+        # Block ALL transitions (override, PTB_PREP) until this elapsed.
+        if self._phase_timer < RELEASE_MIN_DURATION_S:
+            # Markers still moving â€” no transitions allowed
+            pass
+        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+        # PTB gate safety override: force-transition after timeout
+        if self._phase_timer < RELEASE_MIN_DURATION_S:
+            # Block override â€” protection gate still active
+            pass
+        else:
+            if self._ptb_gate_override_frames >= 300:
+                self._ptb_gate_override_frames = 300  # initialise countdown
+            self._ptb_gate_override_frames -= 1
+            if self._ptb_gate_override_frames <= 0:
+                print(f"[PTB_OVERRIDE] RELEASE stuck â€” forcing PTB_PREP")
+                self._enter_ptb_prep()
+                return
+
+        # â•â•â• Engine-Spec: Move markers toward X-axis targets each frame â•â•â•
+        self._move_markers_to_targets(dt)
+        for _m in self._get_markers():
+            _m.update(dt)
+
+        # Unfreeze BC and apply RELEASE movement toward ruck target
+        bc = self.ball_carrier
+        if bc is not None:
+            # BC already has target_x = ruck_x, target_y = ruck_y, move_speed = RELEASE_RECOVERY_SPEED_MPS
+            # set during detachment on frame 1. Apply movement every frame.
+            if not bc.frozen:
+                bc.update(dt)
+                # â•â•â• SDEA BC backward invariant â€” no forward movement during RELEASE â•â•â•
+                enforce_bc_backward_invariant(bc, self.world)
+
+        # Scan entire defending team for any remaining tackler flags
+        # (self.primary and self.joiners are already cleared by _prepare_release)
+        # CRITICAL: Do NOT set frozen=False here â€” the RELEASE freeze controller
+        # (ai_tes_controller with phase="RELEASE" -> _enforce_release_freeze) handles
+        # freeze state correctly for each role per the compliance checklist.
+        for tackler in self.world.defending_team:
+            if tackler.is_tackler or tackler.in_contact or tackler.tes_locked or tackler.tackle_locked:
+                tackler.is_tackler = False
+                tackler.in_contact = False
+                tackler.tackle_locked = False
+                tackler.tes_locked = False
+
+        # P7: Pre-position DH toward 1m behind BC during RELEASE window
+        if self.dh is not None and bc is not None:
+            from game.tes.ptb_manager import _DH_BEHIND_DISTANCE_M
+            dh_target_x = bc.x - _DH_BEHIND_DISTANCE_M
+            dh_target_y = self.world.ruck_y_m
+            self.dh.target_x = dh_target_x
+            self.dh.target_y = dh_target_y
+            self.dh.move_speed = 4.0  # moderate pre-positioning speed
+            self.dh.update(dt)
+
+        # â•â•â• Clear tes_active at end of RELEASE (Section B) â•â•â•
+        self.world.tes_active = False
+        # P7: Continuous retreat for DEF_RETREAT_10 during RELEASE
+        _rx = getattr(self.world, "ruck_x_m", 60.0)
+        _rt = _rx + RETREAT_COMPLIANCE_DISTANCE_M
+        for _d in self.world.defending_team:
+            if _d.defender_role == DefenderRole.DEF_RETREAT_10:
+                _d.target_x = _rt
+                _d.target_y = _d.y
+                _d.update(dt)  # P4: apply retreat movement
+
+        # â•â•â• RELEASE FREEZE ENFORCEMENT â€” delegated to unified controller â•â•â•â•â•â•â•â•
+        ai_tes_controller(self.world, self.dh, "RELEASE")
+
+        # Wait for PTB time (from tes_outcome) AND DH readiness before transitioning
+        # Minimum 1.54s ensures markers have time to reach X-axis targets:
+        #   MARKER_A needs 0.94s to reach ruck_x + 1.0
+        #   MARKER_B needs 1.44s to reach ruck_x + 2.0
+        #   + 0.10s buffer = 1.54s
+        ptb_t = max(1.54, self.tes_outcome.ptb_time_s if self.tes_outcome else 1.54)
+        if self._phase_timer >= ptb_t:
+            # P1: Gate PTB_PREP entry on DH readiness â€” DH must be positioned,
+            # stable, and behind BC before PTB can begin.
+            if self.dh is not None and bc is not None:
+                if self._check_dh_ready_for_ptb(for_exec=False):
+                    self._enter_ptb_prep()
+                else:
+                    pass
+            else:
+                self._enter_ptb_prep()
+
+    def _enter_ptb_prep(self) -> None:
+        """RELEASE -> PTB_PREP: hand control of DH to PTBManager.
+
+        CRITICAL: PTB_PREP still needs the tackled BC's position (bc.x)
+        for PTBManager to compute DH targets (bc.x - 1.0).  The old BC
+        is NOT cleared here â€” it stays valid until PTB_EXEC->PTB handover
+        where set_ball_carrier(self.world, self.dh) transfers ownership.
+        """
+        if self.dh is not None:
+            if self.ptb_manager.state == "idle":
+                bc = self.world.ball_carrier
+                self.ptb_manager.start_prep(
+                    self.dh,
+                    bc,
+                    self.world.ruck_y_m,
+                )
+        self._set_phase("PTB_PREP", GameSubState.PTB, "RELEASE->PTB_PREP")
+
+    # -- PTB_PREP -------------------------------------------------------
+
+    def _update_ptb_prep(self, dt: float) -> None:
+        """
+        PTB_PREP: DH moves to behind-ball position via PTBManager.
+
+        CRITICAL: No dh_controller.move_to_ruck() here.
+        No geometry/containment/retreat touches DH.
+        PTBManager is the sole authority for DH movement.
+
+        Engine-Spec X-Axis: Markers continue moving to X-axis targets.
+        They are NOT frozen and do NOT use Y-offsets.
+        """
+        bc = self.world.ball_carrier
+        if bc is not None:
+            bc.attack_role = "ball_carrier"
+        # PTB gate safety override: force-transition after timeout
+        if self._ptb_gate_override_frames >= 300:
+            self._ptb_gate_override_frames = 300
+        self._ptb_gate_override_frames -= 1
+        if self._ptb_gate_override_frames <= 0:
+            print(f"[PTB_OVERRIDE] PTB_PREP stuck â€” forcing PTB_EXEC")
+            if self.dh is not None and self.ball_carrier is not None:
+                self.ptb_manager.start_exec(self.dh, self.ball_carrier,
+                                            getattr(self.world, "ruck_y_m", 0.0))
+            self._set_phase("PTB_EXEC", GameSubState.PTB, "PTB_PREP_OVERRIDE->PTB_EXEC")
+            return
+
+        if self.dh is None:
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "PTB_PREP_NO_DH")
+            return
+
+        # â•â•â• Engine-Spec: Move markers toward X-axis targets each frame â•â•â•
+        self._move_markers_to_targets(dt)
+        # Ensure markers actually move this frame â€” their movement runs here
+        # because _update_defence() returns early during PTB sub-state.
+        for _m in self._get_markers():
+            _m.update(dt)
+
+        # PTBManager drives DH movement -- NO other system touches DH here
+        bc = self.world.ball_carrier
+        ready = self.ptb_manager.update_prep(
+            dt,
+            self.dh,
+            bc,
+            self.world.ruck_y_m,
+        )
+
+        # Freeze managed by apply_phase_invariants() â€” not set here
+
+        # Engine-Spec: REPLACED old P16 block that froze markers at Y-offsets.
+        # Markers are now moved by _move_markers_to_targets() above.
+        # No freeze or Y-offset assignment here.
+
+        # P7: Continuous retreat for DEF_RETREAT_10 during PTB_PREP
+        _rx = getattr(self.world, "ruck_x_m", 60.0)
+        _rt = _rx + RETREAT_COMPLIANCE_DISTANCE_M
+        for _d in self.world.defending_team:
+            if _d.defender_role == DefenderRole.DEF_RETREAT_10:
+                _d.target_x = _rt
+                _d.target_y = _d.y
+                _d.update(dt)  # P4: apply movement since _update_defence is skipped
+
+        # P3: Gate PTB_PREP -> PTB_EXEC on OPE-side DH readiness checks
+        if ready and self._check_dh_ready_for_ptb(for_exec=False):
+            self.ptb_manager.start_exec(
+                self.dh,
+                self.world.ball_carrier,
+                self.world.ruck_y_m,
+            )
+            self._set_phase("PTB_EXEC", GameSubState.PTB, "PTB_PREP->PTB_EXEC")
+
+    # -- PTB_EXEC -------------------------------------------------------
+
+    def _update_ptb_exec(self, dt: float) -> None:
+        """
+        PTB_EXEC: DH moves to scoop position via PTBManager.
+
+        CRITICAL: No dh_controller.move_to_ruck() here.
+        PTBManager is the sole authority for DH movement.
+
+        Engine-Spec X-Axis: Markers continue moving to X-axis targets.
+        At PTB handover (PTB_EXEC -> PTB), offside check runs.
+        """
+        bc = self.world.ball_carrier
+        if bc is not None:
+            bc.attack_role = "ball_carrier"
+        # PTB gate safety override: force-transition after timeout
+        if self._ptb_gate_override_frames >= 300:
+            self._ptb_gate_override_frames = 300
+        self._ptb_gate_override_frames -= 1
+        if self._ptb_gate_override_frames <= 0:
+            print(f"[PTB_OVERRIDE] PTB_EXEC stuck — forcing PTB")
+            if self.dh is not None and self.ball_carrier is not None:
+                self.ptb_manager.complete(self.dh, self.ball_carrier)
+            # Post-PTB scoot: reset marker lock + frame counter
+            self._on_ptb_complete()
+            # Run offside check before forced transition
+            self._check_marker_offside()
+            self._set_phase("PTB", GameSubState.PTB, "PTB_EXEC_OVERRIDE->PTB")
+            return
+
+        if self.dh is None:
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "PTB_EXEC_NO_DH")
+            return
+
+        # â•â•â• Engine-Spec: Move markers toward X-axis targets each frame â•â•â•
+        self._move_markers_to_targets(dt)
+        # Ensure markers actually move this frame â€” _update_defence() is skipped
+        # during PTB sub-state.
+        for _m in self._get_markers():
+            _m.update(dt)
+
+        # PTBManager drives DH movement (targets bc.x - 1.0 each frame)
+        bc = self.world.ball_carrier
+        ready = self.ptb_manager.update_exec(
+            dt,
+            self.dh,
+            bc,
+            self.world.ruck_y_m,
+        )
+
+        # P7: Continuous retreat for DEF_RETREAT_10 during PTB_EXEC
+        _rx = getattr(self.world, "ruck_x_m", 60.0)
+        _rt = _rx + RETREAT_COMPLIANCE_DISTANCE_M
+        for _d in self.world.defending_team:
+            if _d.defender_role == DefenderRole.DEF_RETREAT_10:
+                _d.target_x = _rt
+                _d.target_y = _d.y
+                _d.update(dt)  # P4: apply movement since _update_defence is skipped
+
+        # Freeze managed by apply_phase_invariants() â€” not set here
+
+        # P6/P8: Gate PTB_EXEC -> PTB on DH readiness with exec-level checks
+        dh_ready = self._check_dh_ready_for_ptb(for_exec=True)
+
+        if ready and dh_ready:
+            # PTB_EXEC -> PTB: ball transfer
+            bc = self.ball_carrier
+            self.ptb_manager.complete(self.dh, bc)
+
+            # Markers frozen for 1 second after PTB handover
+            for _m in self._get_markers():
+                _m.frozen = True
+                _m.marker_freeze_timer = 1.0
+
+            # Post-PTB scoot: reset marker lock + frame counter
+            # NOTE: _on_ptb_complete() resets world.marker_freeze_timer
+            # so applied_phase_invariants() can re-freeze markers during
+            # the lock window.  Marker roles are NOT cleared here —
+            # they survive through PTB and POST_RUCK_OPEN_PLAY so the
+            # freeze system can find MARKER_A/B roles to freeze.
+            self._on_ptb_complete()
+            if self.ptb_manager.state == "complete":
+                # D3/D4/D6: Defer D-series state writes through _update_defence()
+                # to avoid calling defence subsystems outside _update_defence().
+                self._pending_anchor_x = self.dh.x + 10.0
+                self._pending_retreat_reset = True
+                self._pending_spacing_y = self.world.ruck_y_m
+
+            # Update internal reference
+            self.ball_carrier = self.dh
+
+            # D5: BC facing + initial run vector (DH becomes new BC)
+            new_bc = self.dh
+            new_bc.facing = 0.0   # Attack direction (right, +X)
+            new_bc.vx = 2.0
+            new_bc.vy = 0.0
+
+            # DH must start PTB from DH's actual physical position
+            set_ball_carrier(self.world, self.dh)
+
+            # Ensure DH is unfrozen and ready
+            self.dh.freeze_timer = 0.0
+
+            # DH must receive tuners + intent + perception
+            if self.dh.tuners is None:
+                self.dh.tuners = AttackTuners()
+
+            # Re-initialise DH perception/intent
+            dh_per = self.attack_perception.compute(self.dh)
+            self.dh.intent = self.ball_carrier_intent.decide(self.dh, dh_per)
+
+            # Transition to PTB phase
+            self._set_phase("PTB", GameSubState.PTB, "PTB_EXEC->PTB")
+
+    # -- PTB ------------------------------------------------------------
+
+    def _update_ptb(self, dt: float) -> None:
+        """
+        PTB phase â€” dummy half runs with ball.
+        Attack controller manages DH movement.
+
+        Spec 6.3: DH is the ball carrier, defence is suppressed,
+        markers peel.  DH runs, then PTB kicks.
+
+        Engine-Spec X-Axis: Offside markers must be retreating to
+        ruck_x + 10 to regain onside.  Onside markers continue to
+        move to their X-axis targets (or peel if _trigger_marker_peel
+        has already run).
+        """
+        bc = self.world.ball_carrier
+        if bc is not None:
+            bc.attack_role = "ball_carrier"
+        dh = self.dh
+        if dh is None:
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "PTB_NO_DH")
+            return
+
+        # P1: increment phase timer so timeout safety can fire
+        self._phase_timer += dt
+
+        # Engine-Spec: Move markers toward X-axis targets (if still MARKER_A/B)
+        self._move_markers_to_targets(dt)
+        # Ensure markers actually move this frame â€” _update_defence() is skipped
+        # during PTB sub-state.
+        for _m in self._get_markers():
+            _m.update(dt)
+
+        # P8: Gate attack_controller on ptb_manager.state == "complete"
+        if dh.tuners is None:
+            dh.tuners = AttackTuners()
+        if self.ptb_manager.state == "complete":
+            # Ball transferred — DH can now move under attack controller
+            self.attack_controller.apply_vector(dh, self.world, dt)
+            # CRITICAL: execute DH physics step to resolve target_x/y into movement.
+            # Without this, apply_vector() sets targets but DH never moves.
+            dh.update(dt)
+        else:
+            # Ball NOT yet transferred — suppress attack_controller's random vector.
+            dh.vx = 0.0
+            dh.vy = 0.0
+
+        # P10: Runtime diagnostic â€” log DH distance to 1m target every frame
+        if self.world.frame_count % 10 == 0:
+            from game.tes.ptb_manager import _DH_BEHIND_DISTANCE_M
+            actual_dist = dh.x - self.world.ruck_x_m
+            if abs(actual_dist - _DH_BEHIND_DISTANCE_M) > 0.5:
+                print(f"[DH_POS] DH #{dh.player_id} is {actual_dist:.2f}m behind ruck "
+                      f"(target: {_DH_BEHIND_DISTANCE_M:.1f}m) phase={self._phase}")
+
+        # P7: Continuous retreat for DEF_RETREAT_10 during PTB
+        _rx = getattr(self.world, "ruck_x_m", 60.0)
+        _rt = _rx + RETREAT_COMPLIANCE_DISTANCE_M
+        for _d in self.world.defending_team:
+            if _d.defender_role == DefenderRole.DEF_RETREAT_10:
+                _d.target_x = _rt
+                _d.target_y = _d.y
+
+        # Spec 6.4: PTB completes when DH has been in PTB long enough
+        DUCKOUT_DISTANCE = 2.0
+        PTB_TIMEOUT_S = 2.0
+
+        if self.ptb_manager.state == "complete":
+            dx = abs(dh.x - self.world.ruck_x_m)
+            dy = abs(dh.y - self.world.ruck_y_m)
+            if dx > DUCKOUT_DISTANCE or dy > DUCKOUT_DISTANCE:
+                # Engine-Spec: Freeze markers for 1s on PTB completion
+                for _m in self._get_markers():
+                    _m.frozen = True
+                    _m.marker_freeze_timer = 1.0
+                self._set_phase("POST_RUCK_OPEN_PLAY",
+                                GameSubState.POST_RUCK_OPEN_PLAY,
+                                "PTB->POST_RUCK")
+        else:
+            pass
+
+        # Timeout safety: force PTB completion after timeout
+        if self._phase_timer >= PTB_TIMEOUT_S:
+            # Post-PTB scoot: reset marker lock + frame counter
+            self._on_ptb_complete()
+            # Engine-Spec: Freeze markers for 1s on PTB completion
+            for _m in self._get_markers():
+                _m.frozen = True
+                _m.marker_freeze_timer = 1.0
+            self._set_phase("POST_RUCK_OPEN_PLAY",
+                            GameSubState.POST_RUCK_OPEN_PLAY,
+                            "PTB->POST_RUCK (timeout)")
+
+    # -- POST_RUCK_OPEN_PLAY --------------------------------------------
+
+    def _update_post_ruck_open_play(self, dt: float) -> None:
+        """
+        POST_RUCK_OPEN_PLAY: defenders retreat individually,
+        transitioning to DEF_LINE_READY once compliant.
+
+        BC continues to move under the attack controller every frame,
+        exactly like PTB and OPEN_PLAY phases.  No freeze.
+
+        Spec 9: Per-defender DEF_RETREAT_10->DEF_LINE_READY.
+
+        Engine-Spec: Markers are frozen for 1s after PTB handover.
+        Freeze timer counts down each frame.  When expired:
+          - d.frozen = False
+          - d.marker_freeze_timer = 0.0
+          - d.defender_role = DEF_LINE_READY
+          - d.apply_physics_forces = True (restore normal physics)
+
+        No offside. No retreat. No defensive behaviour for markers.
+        """
+        self._phase_timer += dt
+        ruck_x = self.world.ruck_x_m
+
+        # â•â•â• BC continues to move under attack controller â•â•â•
+        bc = self.world.ball_carrier
+        if bc is not None:
+            self.attack_controller.apply_vector(bc, self.world, dt)
+
+        # â•â•â• Engine-Spec: Marker freeze timer countdown â•â•â•
+        # Frozen markers: no movement, no physics forces, no collision.
+        # When freeze expires: restore physics, collision, and transition to line.
+        for d in self.world.defending_team:
+            if d.defender_role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B):
+                d.marker_freeze_timer -= dt
+                if d.marker_freeze_timer > 0.0:
+                    # Active freeze: apply_phase_invariants() handles frozen
+                    d.apply_physics_forces = False
+                    d.body.collision_enabled = False
+                else:
+                    # Freeze expired: restore everything
+                    d.marker_freeze_timer = 0.0
+                    d.apply_physics_forces = True
+                    d.body.collision_enabled = True
+                    d.defender_role = DefenderRole.DEF_LINE_READY
+
+        # P8: Per-defender retreat + transition
+        # NOTE: Every non-marker defender gets a retreat target each frame
+        # during POST_RUCK.  This prevents the "frozen" appearance where
+        # non-DEF_RETREAT_10 defenders (DEF_LINE_READY, DEF_CHASE, etc.)
+        # stand still for the entire ~2s window because _update_defence()
+        # is gated out.
+        all_compliant = True
+        retreat_speed = self.def_tuners.retreat_compliance_distance_m * 0.6 if hasattr(self.def_tuners, 'retreat_compliance_distance_m') else 6.0
+        target_x = ruck_x + RETREAT_COMPLIANCE_DISTANCE_M
+        for d in self.world.defending_team:
+            if d.defender_role == DefenderRole.DUMMY_HALF:
+                continue
+            if d.defender_role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B):
+                # Markers do NOT retreat â€” they hold at X-axis positions
+                # (their freeze timer is handled by the marker block above)
+                continue
+            # ALL non-marker, non-DH defenders get a retreat target every frame.
+            # This keeps them moving during the entire POST_RUCK phase
+            # instead of standing still when not yet in DEF_RETREAT_10.
+            if d.x < target_x:
+                _move_toward(d, target_x, d.y, 6.0, dt)
+            if d.defender_role == DefenderRole.DEF_RETREAT_10:
+                if d.x >= target_x:
+                    d.defender_role = DefenderRole.DEF_LINE_READY
+                    d.frozen = False
+                else:
+                    all_compliant = False
+
+        # Transition to OPEN_PLAY when all compliant OR after timeout
+        # POST_RUCK_DURATION_S set to 0.05 so engine flips to OPEN_PLAY
+        # almost instantly after PTB finishes (~3 frames at 60fps).
+        POST_RUCK_DURATION_S: float = 0.05
+        if all_compliant or self._phase_timer >= POST_RUCK_DURATION_S:
+            # =============================================================
+            # POST_RUCK -> OPEN_PLAY: final marker role clear + state restore
+            # =============================================================
+            self._post_ruck_marker_cleanup()
+            bc = self.world.ball_carrier
+            if bc is not None:
+                self.attack_controller.apply_vector(bc, self.world, dt)
+            self._set_phase("OPEN_PLAY", GameSubState.OPEN_PLAY, "POST_RUCK->OPEN_PLAY")
+
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # POST_RUCK_MARKER_CLEANUP â€” Final marker role clear + state restore
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _assign_defensive_line_targets(self) -> None:
+        """Assign immediate defensive line targets for all non-marker defenders.
+
+        Called from _post_ruck_marker_cleanup() to ensure defenders have
+        valid target positions on the first OPEN_PLAY frame.
+
+        Sets target_x = ruck_x + def_line_depth_m for each defender that
+        is not a marker, DUMMY_HALF, or already past the line.
+        """
+        ruck_x = getattr(self.world, "ruck_x_m", None)
+        if ruck_x is None:
+            return
+        line_x = ruck_x + self.def_tuners.def_line_depth_m
+        for d in self.world.defending_team:
+            if d.defender_role in (DefenderRole.MARKER_A, DefenderRole.MARKER_B):
+                continue
+            if d.defender_role == DefenderRole.DUMMY_HALF:
+                continue
+            d.target_x = line_x
+            d.target_y = d.y
+
+    def _post_ruck_marker_cleanup(self) -> None:
+        """Final cleanup when transitioning POST_RUCK_OPEN_PLAY -> OPEN_PLAY.
+
+        1.  Clears MARKER_A/B roles â†’ DEF_LINE_READY
+        2.  Restores normal defender physics (apply_physics_forces, frozen)
+        3.  Purges ALL TES flags (is_tackler, in_contact, tackle_locked, tes_locked)
+        4.  Assigns defensive line targets immediately
+        5.  Calls _reset_tackle_state() AFTER roles are cleared
+        """
+        for p in self.world.defending_team:
+            # 1. Clear stale marker roles (critical)
+            if p.defender_role in (
+                DefenderRole.MARKER_A,
+                DefenderRole.MARKER_B,
+            ):
+                p.defender_role = DefenderRole.DEF_LINE_READY
+
+            # 2. Restore normal defender physics
+            p.apply_physics_forces = True
+
+            # 3. Purge ALL TES flags (belt-and-suspenders)
+            p.is_tackler = False
+            p.in_contact = False
+            p.tackle_locked = False
+            p.tes_locked = False
+
+            # 4. Purge ALL cached defence-subsystem state so the next
+            #    _update_defence() runs on a clean slate.  Without this,
+            #    stale depth_class, timing_locked, reaction_timer, freeze_timer
+            #    and other per-defender cached values from the previous tackle
+            #    cycle survive into OPEN_PLAY and can freeze defenders on the
+            #    first OPEN_PLAY frame.
+            p.depth_class = "PASSIVE"        # forces fresh classification
+            p.timing_locked = False
+            p.reaction_timer = 0.0
+            p.retreat_delay = 0.0
+            p.lateral_hesitation = 0.0
+            p.step_stagger = 0.0
+            p.step_stagger_active = False
+            p._prev_depth_class = None
+            p.lane_index = 0
+            p.tackle_role = "PASSIVE"
+            p.freeze_timer = 0.0
+            p.marker_freeze_timer = 0.0
+
+        # 5. Assign defensive line targets IMMEDIATELY
+        self._assign_defensive_line_targets()
+
+        # 6. Reset tackle state AFTER roles are cleared
+        self._reset_tackle_state()
+
+    def _reset_tackle_state(self):
+        """
+        Reset all tackle-related state after POST_RUCK_OPEN_PLAY completes.
+        This ensures OPEN_PLAY starts clean with no leftover TES/marker roles.
+
+        P14: Clear ALL TACKLER_* and MARKER_* roles from all defenders,
+        converting them to DEF_LINE_READY.  This is a belt-and-suspenders
+        sweep so no defender remains frozen or in a stale role after PTB.
+        """
+        # Clear TES context
+        self.tes_ctx = None
+        self.tes_outcome = None
+
+        # P14: Sweep all defenders for stale TACKLER_* / MARKER_* roles
+        for d in self.world.defending_team:
+            if d.defender_role in (
+                DefenderRole.TACKLER_1,
+                DefenderRole.TACKLER_2,
+                DefenderRole.TACKLER_3,
+                DefenderRole.MARKER_A,
+                DefenderRole.MARKER_B,
+            ):
+                d.defender_role = DefenderRole.DEF_LINE_READY
+                d.is_tackler = False
+                d.in_contact = False
+                d.tes_locked = False
+                d.tackle_locked = False
+                d.marker_freeze_timer = 0.0
+                d.freeze_timer = 0.0
+            # Fix H: restore normal physics for ALL defenders unconditionally
+            # (RELEASE per-frame protection sets apply_physics_forces=False for
+            # everyone each frame, so we must clear it for everyone on reset)
+            d.apply_physics_forces = True
+
+        # Unconditional sweep: clear ALL freeze/stall timers on every defender.
+        # MARKER_A/B freeze_timer was set by _assign_markers_for_new_tackle() and
+        # survives role clear in _post_ruck_marker_cleanup(), causing
+        # _apply_structured_open_play() to re-freeze former markers on OPEN_PLAY entry.
+        for d in self.world.defending_team:
+            d.freeze_timer = 0.0
+            d.marker_freeze_timer = 0.0
+        # P2: Clear old DUMMY_HALF role from all attackers so the previous
+        # cycle's DH doesn't wander around with a stale defender_role.
+        for p in self.world.attacking_team:
+            if getattr(p, "defender_role", None) == DefenderRole.DUMMY_HALF:
+                p.defender_role = None
+
+        # Clear OPE tackler references (belt-and-suspenders)
+        self.primary = None
+        self.joiners.clear()
+
+        # Clear any TES flags
+        self.world.tes_active = False
+    def _check_break_tackle(self, dt: float) -> bool:
+        """
+        Spec 7.1: During TES_DRIVE/CONTACT/DOMINANCE, if BC drive_force or
+        speed exceeds defender_resistance threshold:
+          - Cancel TES, cancel markers, cancel PTB.
+          - Switch to OPEN_PLAY immediately.
+          - Former tacklers within chase_radius -> DEF_CHASE.
+          - Former tacklers offside -> DEF_RETREAT_10.
+        Returns True if break-tackle occurred (TES cancelled).
+        """
+        bc = self.ball_carrier
+        if bc is None or self.tes_ctx is None:
+            return False
+        bc_speed = math.hypot(bc.vx, bc.vy)
+        bc_mass = getattr(bc, "mass_kg", 90.0)
+        bc_momentum = bc_mass * bc_speed
+        total_def_momentum = self.tes_ctx.engagement.total_momentum()
+        def_resistance = total_def_momentum if total_def_momentum > 0 else bc_momentum * 0.5
+        if bc_momentum > def_resistance * 1.4 or bc_speed > 7.0:
+            print(f"[BREAK_TACKLE] BC #{bc.player_id} momentum={bc_momentum:.1f} > def_resistance={def_resistance:.1f} x 1.4 -- BREAK!")

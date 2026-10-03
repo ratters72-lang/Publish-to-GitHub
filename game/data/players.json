@@ -1,0 +1,80 @@
+[
+  {
+    "id": 1,
+    "name": "James Tedesco",
+    "position": "FB",
+    "team_id": 0,
+    "speed": 90,
+    "strength": 65,
+    "tackle_skill": 55,
+    "offload_skill": 70,
+    "aggression": 60,
+    "stamina": 85,
+    "mass_kg": 88
+  },
+  {
+    "id": 2,
+    "name": "Tom Trbojevic",
+    "position": "FB",
+    "team_id": 1,
+    "speed": 92,
+    "strength": 70,
+    "tackle_skill": 60,
+    "offload_skill": 75,
+    "aggression": 65,
+    "stamina": 82,
+    "mass_kg": 92
+  },
+  {
+    "id": 3,
+    "name": "Nathan Cleary",
+    "position": "HB",
+    "team_id": 0,
+    "speed": 78,
+    "strength": 60,
+    "tackle_skill": 80,
+    "offload_skill": 50,
+    "aggression": 55,
+    "stamina": 88,
+    "mass_kg": 85
+  },
+  {
+    "id": 4,
+    "name": "Payne Haas",
+    "position": "PR",
+    "team_id": 1,
+    "speed": 72,
+    "strength": 95,
+    "tackle_skill": 85,
+    "offload_skill": 70,
+    "aggression": 90,
+    "stamina": 80,
+    "mass_kg": 110
+  },
+  {
+    "id": 5,
+    "name": "Cameron Murray",
+    "position": "LK",
+    "team_id": 0,
+    "speed": 80,
+    "strength": 75,
+    "tackle_skill": 90,
+    "offload_skill": 80,
+    "aggression": 75,
+    "stamina": 90,
+    "mass_kg": 92
+  },
+  {
+    "id": 6,
+    "name": "Jason Taumalolo",
+    "position": "LK",
+    "team_id": 1,
+    "speed": 85,
+    "strength": 92,
+    "tackle_skill": 78,
+    "offload_skill": 65,
+    "aggression": 95,
+    "stamina": 85,
+    "mass_kg": 110
+  }
+]
